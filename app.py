@@ -7,15 +7,15 @@ import streamlit as st
 import plotly.graph_objects as go
 import yfinance as yf
 
-st.set_page_config(page_title="RSP Ultimate Breadth Oscillator Lab — Phase 2.2", layout="wide")
-st.title("RSP Ultimate Breadth Oscillator Lab — Phase 2.2")
+st.set_page_config(page_title="RSP Ultimate Breadth Oscillator Lab — Phase 2.3", layout="wide")
+st.title("RSP Ultimate Breadth Oscillator Lab — Phase 2.3")
 
 st.sidebar.header("Inputs")
 symbol = st.sidebar.text_input("ETF symbol", "RSP")
-years = st.sidebar.slider("Historical lookback (years)", 5, 25, 10)
+years = st.sidebar.slider("Historical lookback (years)", 5, 25, 25)
 breadth_weight = st.sidebar.slider("Breadth weight in ultimate oscillator", 0.0, 1.0, 0.45, 0.05)
 daily_smooth = st.sidebar.slider("Daily smoothing", 3, 25, 9)
-weekly_smooth = st.sidebar.slider("Weekly smoothing", 2, 12, 4)
+weekly_smooth = st.sidebar.slider("Weekly smoothing", 2, 12, 5)
 zip_file = st.sidebar.file_uploader("Upload breadth bucket zip", type="zip")
 snapshot_file = st.sidebar.file_uploader("Upload daily snapshot csv (SC format)", type="csv")
 
@@ -23,27 +23,25 @@ st.sidebar.subheader("Display")
 show_price_only = st.sidebar.checkbox("Show RSP-only oscillator", True)
 show_breadth = st.sidebar.checkbox("Show RSP + breadth oscillator", True)
 
-def clean_num(s: pd.Series) -> pd.Series:
+view_options = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730, "5Y": 1825, "10Y": 3650, "Max": None}
+view_choice = st.sidebar.selectbox("Oscillator view window", list(view_options.keys()), index=4)
+
+def clean_num(s):
     return pd.to_numeric(
-        s.astype(str)
-         .str.replace(",", "", regex=False)
-         .str.replace("$", "", regex=False)
-         .str.strip(),
+        s.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip(),
         errors="coerce",
     )
 
-def parse_stockcharts_csv_bytes(file_bytes: bytes):
+def parse_stockcharts_csv_bytes(file_bytes):
     text = file_bytes.decode("utf-8", errors="ignore")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < 3:
         return None
-
     if "Date" in lines[1] and "Close" in lines[1]:
         raw = pd.read_csv(io.StringIO("\n".join(lines[1:])))
         raw.columns = [str(c).strip() for c in raw.columns]
         if "Date" not in raw.columns:
             return None
-
         value_col = None
         for cand in ["Close", "Adj Close", "Value", "Last", "RSP"]:
             if cand in raw.columns:
@@ -56,43 +54,13 @@ def parse_stockcharts_csv_bytes(file_bytes: bytes):
                     break
         if value_col is None:
             return None
-
         dates = pd.to_datetime(raw["Date"], errors="coerce")
         vals = clean_num(raw[value_col])
         out = pd.DataFrame({"value": vals.to_numpy()}, index=dates)
         out = out[~out.index.isna()].dropna().sort_index()
         out = out[~out.index.duplicated(keep="last")]
         return out if len(out) else None
-
-    raw = pd.read_csv(io.StringIO(text))
-    raw.columns = [str(c).strip() for c in raw.columns]
-    date_col = None
-    for cand in ["Date", "date", "DATE", "Datetime", "datetime", "timestamp"]:
-        if cand in raw.columns:
-            date_col = cand
-            break
-    if date_col is None:
-        return None
-
-    value_col = None
-    for cand in ["Close", "Adj Close", "Value", "Last", "RSP", "close", "rsp", "value", "last"]:
-        if cand in raw.columns:
-            value_col = cand
-            break
-    if value_col is None:
-        for c in raw.columns:
-            if str(c).lower() not in {"date", "datetime", "timestamp", "name", "symbol"}:
-                value_col = c
-                break
-    if value_col is None:
-        return None
-
-    dates = pd.to_datetime(raw[date_col], errors="coerce")
-    vals = clean_num(raw[value_col])
-    out = pd.DataFrame({"value": vals.to_numpy()}, index=dates)
-    out = out[~out.index.isna()].dropna().sort_index()
-    out = out[~out.index.duplicated(keep="last")]
-    return out if len(out) else None
+    return None
 
 def load_series_from_zip(zip_file, stem):
     if zip_file is None:
@@ -133,7 +101,6 @@ def load_price_history(symbol, years, zip_file, snapshot_map=None, snap_date=Non
     if hist is not None and len(hist) > 50:
         hist = append_snapshot(hist, snapshot_map, snap_date, symbol)
         return hist.rename(columns={"value": "price"})
-
     try:
         df = yf.download(symbol, period=f"{years}y", progress=False, auto_adjust=False)
         if len(df) > 0:
@@ -212,7 +179,6 @@ def build_breadth_score(zip_file, snapshot_map=None, snap_date=None):
         ("_spxa50r", "$SPXA50R", 1.0),
         ("_trin", "$TRIN", -1.0),
         ("_cpce", "$CPCE", -1.0),
-        ("_vix", "$VIX", -1.0),
     ]
     pieces = []
     for stem, snap_symbol, direction in mapping:
@@ -223,10 +189,8 @@ def build_breadth_score(zip_file, snapshot_map=None, snap_date=None):
         vals = hist["value"].astype(float) * direction
         vals = normalize(vals, 200)
         pieces.append(vals.rename(stem))
-
     if not pieces:
         return None
-
     comp = pd.concat(pieces, axis=1).dropna(how="all")
     breadth = comp.mean(axis=1, skipna=True)
     breadth = ema(ema(breadth, 7), 4).clip(0, 100)
@@ -268,6 +232,18 @@ def backtest_crosses(df, long_th, short_th, hold=5, mode="long_cash"):
                 pos = 0
     return (1 + pd.Series(out, index=df.index[1:])).cumprod()
 
+def compute_sweet_spots(df, mode="long_cash"):
+    rows = []
+    for l in [20, 22, 24, 26, 28, 30]:
+        for s in [70, 72, 74, 76, 78, 80]:
+            for h in [3, 5, 8]:
+                eq = backtest_crosses(df, l, s, hold=h, mode=mode)
+                rows.append((l, s, h, float(eq.iloc[-1]) if len(eq) else np.nan))
+    res = pd.DataFrame(rows, columns=["Long Trigger", "Short Trigger", "Hold Bars", "Return"])
+    res["Return"] = pd.to_numeric(res["Return"], errors="coerce")
+    res = res.dropna().sort_values("Return", ascending=False).reset_index(drop=True)
+    return res
+
 def score_state(osc, sig, long_th=24, short_th=76):
     if osc >= long_th and osc >= sig:
         return "LONG", "#16a34a"
@@ -284,9 +260,15 @@ def add_zone_shapes(fig):
     fig.add_hline(y=20)
     fig.add_hline(y=80)
 
+def apply_view_window(df, choice):
+    days = view_options[choice]
+    if days is None or df.empty:
+        return df
+    cutoff = df.index.max() - pd.Timedelta(days=days)
+    return df[df.index >= cutoff]
+
 snapshot_map, snap_date = load_snapshot_map(snapshot_file)
 price_hist = load_price_history(symbol, years, zip_file, snapshot_map, snap_date)
-
 if price_hist is None:
     st.error("Could not load RSP history. Upload breadth zip with rsp.csv.")
     st.stop()
@@ -300,57 +282,82 @@ price_weekly = build_price_oscillator(wk_price_hist["price"], smooth=weekly_smoo
 breadth_weekly = breadth_daily.resample("W-FRI").last() if breadth_daily is not None else None
 ultimate_weekly = combine(price_weekly, breadth_weekly, breadth_weight, weekly_smooth)
 
+daily_bt_df = ultimate_daily if breadth_daily is not None else price_daily
+weekly_bt_df = ultimate_weekly if breadth_weekly is not None else price_weekly
+daily_spots = compute_sweet_spots(daily_bt_df, mode="long_cash")
+weekly_spots = compute_sweet_spots(weekly_bt_df, mode="long_cash")
+
+best_daily_long = int(daily_spots.iloc[0]["Long Trigger"]) if len(daily_spots) else 24
+best_daily_short = int(daily_spots.iloc[0]["Short Trigger"]) if len(daily_spots) else 76
+best_weekly_long = int(weekly_spots.iloc[0]["Long Trigger"]) if len(weekly_spots) else 24
+best_weekly_short = int(weekly_spots.iloc[0]["Short Trigger"]) if len(weekly_spots) else 76
+
 tab1, tab2, tab3, tab4 = st.tabs(["Daily", "Weekly", "Sweet Spots", "Data Check"])
 
 with tab1:
     st.subheader("Daily Oscillator")
-    c1, c2 = st.columns(2)
-    if show_price_only:
-        s1, color1 = score_state(price_daily["osc"].iloc[-1], price_daily["signal"].iloc[-1])
-        c1.markdown(f"<div style='padding:14px;border-radius:10px;background:{color1};color:white;font-weight:700;text-align:center;'>RSP-only: {s1} | Osc {price_daily['osc'].iloc[-1]:.1f}</div>", unsafe_allow_html=True)
-    if show_breadth:
-        use_df = ultimate_daily if breadth_daily is not None else price_daily
-        label = "RSP + Breadth" if breadth_daily is not None else "RSP + Breadth (breadth missing; showing price only)"
-        s2, color2 = score_state(use_df["osc"].iloc[-1], use_df["signal"].iloc[-1])
-        c2.markdown(f"<div style='padding:14px;border-radius:10px;background:{color2};color:white;font-weight:700;text-align:center;'>{label}: {s2} | Osc {use_df['osc'].iloc[-1]:.1f}</div>", unsafe_allow_html=True)
+    use_daily = ultimate_daily if breadth_daily is not None else price_daily
+    state, color = score_state(use_daily["osc"].iloc[-1], use_daily["signal"].iloc[-1], best_daily_long, best_daily_short)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Daily Osc", f"{use_daily['osc'].iloc[-1]:.1f}")
+    c2.metric("Go Long Score", f"{best_daily_long}")
+    c3.metric("Go Short Score", f"{best_daily_short}")
+    c4.metric("State", state)
 
     fig = go.Figure()
+    dvp = apply_view_window(price_daily, view_choice)
+    dvu = apply_view_window(ultimate_daily, view_choice)
     if show_price_only:
-        fig.add_trace(go.Scatter(x=price_daily.index, y=price_daily["osc"], name="RSP-only Osc", line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=price_daily.index, y=price_daily["signal"], name="RSP-only Signal", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=dvp.index, y=dvp["osc"], name="RSP-only Osc", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=dvp.index, y=dvp["signal"], name="RSP-only Signal", line=dict(width=1)))
     if show_breadth and breadth_daily is not None:
-        fig.add_trace(go.Scatter(x=ultimate_daily.index, y=ultimate_daily["osc"], name="RSP + Breadth Osc", line=dict(width=3)))
-        fig.add_trace(go.Scatter(x=ultimate_daily.index, y=ultimate_daily["signal"], name="RSP + Breadth Signal", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=dvu.index, y=dvu["osc"], name="RSP + Breadth Osc", line=dict(width=3)))
+        fig.add_trace(go.Scatter(x=dvu.index, y=dvu["signal"], name="RSP + Breadth Signal", line=dict(width=1)))
     add_zone_shapes(fig)
+    fig.add_hline(y=best_daily_long, line_dash="dot", annotation_text=f"Best Long {best_daily_long}", annotation_position="top left")
+    fig.add_hline(y=best_daily_short, line_dash="dot", annotation_text=f"Best Short {best_daily_short}", annotation_position="bottom left")
+    fig.add_trace(go.Scatter(
+        x=[use_daily.index[-1]], y=[use_daily["osc"].iloc[-1]], mode="markers",
+        marker=dict(size=12, color=color, line=dict(width=2, color="black")), name="Current Score"
+    ))
     st.plotly_chart(fig, width="stretch")
 
 with tab2:
     st.subheader("Weekly Oscillator")
+    use_weekly = ultimate_weekly if breadth_weekly is not None else price_weekly
+    state_w, color_w = score_state(use_weekly["osc"].iloc[-1], use_weekly["signal"].iloc[-1], best_weekly_long, best_weekly_short)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Weekly Osc", f"{use_weekly['osc'].iloc[-1]:.1f}")
+    c2.metric("Go Long Score", f"{best_weekly_long}")
+    c3.metric("Go Short Score", f"{best_weekly_short}")
+    c4.metric("State", state_w)
+
     fig = go.Figure()
+    wvp = apply_view_window(price_weekly, view_choice)
+    wvu = apply_view_window(ultimate_weekly, view_choice)
     if show_price_only:
-        fig.add_trace(go.Scatter(x=price_weekly.index, y=price_weekly["osc"], name="RSP-only Weekly", line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=price_weekly.index, y=price_weekly["signal"], name="RSP-only Weekly Signal", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=wvp.index, y=wvp["osc"], name="RSP-only Weekly", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=wvp.index, y=wvp["signal"], name="RSP-only Weekly Signal", line=dict(width=1)))
     if show_breadth and breadth_weekly is not None:
-        fig.add_trace(go.Scatter(x=ultimate_weekly.index, y=ultimate_weekly["osc"], name="RSP + Breadth Weekly", line=dict(width=3)))
-        fig.add_trace(go.Scatter(x=ultimate_weekly.index, y=ultimate_weekly["signal"], name="RSP + Breadth Weekly Signal", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=wvu.index, y=wvu["osc"], name="RSP + Breadth Weekly", line=dict(width=3)))
+        fig.add_trace(go.Scatter(x=wvu.index, y=wvu["signal"], name="RSP + Breadth Weekly Signal", line=dict(width=1)))
     add_zone_shapes(fig)
+    fig.add_hline(y=best_weekly_long, line_dash="dot", annotation_text=f"Best Long {best_weekly_long}", annotation_position="top left")
+    fig.add_hline(y=best_weekly_short, line_dash="dot", annotation_text=f"Best Short {best_weekly_short}", annotation_position="bottom left")
+    fig.add_trace(go.Scatter(
+        x=[use_weekly.index[-1]], y=[use_weekly["osc"].iloc[-1]], mode="markers",
+        marker=dict(size=12, color=color_w, line=dict(width=2, color="black")), name="Current Score"
+    ))
     st.plotly_chart(fig, width="stretch")
 
 with tab3:
     st.subheader("Sweet Spot Backtest")
     timeframe = st.selectbox("Backtest timeframe", ["Daily", "Weekly"])
-    trade_mode = st.selectbox("Backtest mode", ["long_cash", "long_short"])
-    bt = ultimate_daily if (timeframe == "Daily" and breadth_daily is not None) else (price_daily if timeframe == "Daily" else (ultimate_weekly if breadth_weekly is not None else price_weekly))
-    rows = []
-    for l in [20, 22, 24, 26, 28, 30]:
-        for s in [70, 72, 74, 76, 78, 80]:
-            for h in [3, 5, 8]:
-                eq = backtest_crosses(bt, l, s, hold=h, mode=trade_mode)
-                rows.append((l, s, h, float(eq.iloc[-1]) if len(eq) else np.nan))
-    res = pd.DataFrame(rows, columns=["Long Trigger", "Short Trigger", "Hold Bars", "Return"])
-    res["Return"] = pd.to_numeric(res["Return"], errors="coerce")
-    res = res.dropna().sort_values("Return", ascending=False).reset_index(drop=True)
+    res = daily_spots if timeframe == "Daily" else weekly_spots
     st.dataframe(res, width="stretch")
+    if len(res):
+        top = res.iloc[0]
+        st.success(f"Best {timeframe}: go long at {int(top['Long Trigger'])}, go short at {int(top['Short Trigger'])}, hold {int(top['Hold Bars'])} bars, terminal equity {top['Return']:.3f}")
 
 with tab4:
     st.subheader("Data Check")
