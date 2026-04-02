@@ -15,11 +15,20 @@ years = st.sidebar.slider("Historical lookback (years)", 5, 25, 25)
 breadth_weight = st.sidebar.slider("Breadth weight in ultimate oscillator", 0.0, 1.0, 0.45)
 zip_file = st.sidebar.file_uploader("Upload breadth bucket zip", type="zip")
 
+daily_smooth = st.sidebar.slider("Daily oscillator smoothing", 3, 25, 9)
+weekly_smooth = st.sidebar.slider("Weekly oscillator smoothing", 2, 12, 4)
+
 def _clean_numeric_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
     return pd.to_numeric(s, errors="coerce")
 
-def _find_price_column(df: pd.DataFrame):
+def _find_date_col(df: pd.DataFrame):
+    for cand in ["Date", "date", "DATE", "Datetime", "datetime", "timestamp"]:
+        if cand in df.columns:
+            return cand
+    return None
+
+def _find_price_col(df: pd.DataFrame):
     cols = [str(c).lower().strip() for c in df.columns]
     original = dict(zip(cols, df.columns))
     for cand in ["close", "adj close", "adj_close", "rsp", "value", "last"]:
@@ -30,44 +39,41 @@ def _find_price_column(df: pd.DataFrame):
             return c
     return None
 
+def _find_file_in_zip(z, stem):
+    matches = [n for n in z.namelist() if stem.lower() in n.lower() and n.lower().endswith(".csv")]
+    return matches[0] if matches else None
+
+def load_series_from_zip(zip_file, stem, value_name):
+    try:
+        zip_file.seek(0)
+    except Exception:
+        pass
+    with zipfile.ZipFile(zip_file) as z:
+        name = _find_file_in_zip(z, stem)
+        if not name:
+            return None
+        raw = pd.read_csv(z.open(name))
+        raw.columns = [str(c).strip() for c in raw.columns]
+        date_col = _find_date_col(raw)
+        if date_col is None:
+            return None
+        val_col = _find_price_col(raw)
+        if val_col is None:
+            return None
+        out = pd.DataFrame(
+            {value_name: _clean_numeric_series(raw[val_col])},
+            index=pd.to_datetime(raw[date_col], errors="coerce"),
+        )
+        out = out[~out.index.isna()].sort_index()
+        out = out.dropna()
+        out = out[~out.index.duplicated(keep="last")]
+        return out if len(out) > 50 else None
+
 def load_rsp_history(symbol, years, zip_file):
     if zip_file is not None:
-        try:
-            zip_file.seek(0)
-        except Exception:
-            pass
-
-        with zipfile.ZipFile(zip_file) as z:
-            rsp_candidates = [n for n in z.namelist() if "rsp" in n.lower() and n.lower().endswith(".csv")]
-            for name in rsp_candidates:
-                try:
-                    raw = pd.read_csv(z.open(name))
-                    raw.columns = [str(c).strip() for c in raw.columns]
-
-                    date_col = None
-                    for cand in ["Date", "date", "DATE", "Datetime", "datetime", "timestamp"]:
-                        if cand in raw.columns:
-                            date_col = cand
-                            break
-                    if date_col is None:
-                        continue
-
-                    price_col = _find_price_column(raw)
-                    if price_col is None:
-                        continue
-
-                    df = pd.DataFrame(
-                        {"price": _clean_numeric_series(raw[price_col])},
-                        index=pd.to_datetime(raw[date_col], errors="coerce"),
-                    )
-                    df = df[~df.index.isna()].sort_index()
-                    df = df.dropna(subset=["price"])
-                    df = df[~df.index.duplicated(keep="last")]
-                    if len(df) > 50:
-                        return df
-                except Exception:
-                    continue
-
+        df = load_series_from_zip(zip_file, "rsp", "price")
+        if df is not None:
+            return df
     try:
         df = yf.download(symbol, period=f"{years}y", progress=False, auto_adjust=False)
         if isinstance(df, pd.DataFrame) and len(df) > 0:
@@ -86,12 +92,10 @@ def load_rsp_history(symbol, years, zip_file):
                 else:
                     s = df.iloc[:, 0]
             out = pd.DataFrame({"price": pd.to_numeric(s, errors="coerce")}, index=pd.to_datetime(df.index))
-            out = out.dropna(subset=["price"])
-            if len(out) > 50:
-                return out
+            out = out.dropna()
+            return out if len(out) > 50 else None
     except Exception:
         pass
-
     return None
 
 def rsi(series, length=14):
@@ -128,116 +132,159 @@ def normalize(x, lookback=200):
     lo = x.rolling(lookback).min()
     hi = x.rolling(lookback).max()
     denom = (hi - lo).replace(0, np.nan)
-    return (x - lo) / denom * 100
+    return ((x - lo) / denom * 100).clip(0, 100)
 
-def build_oscillator(df):
-    px = pd.to_numeric(df["price"], errors="coerce").dropna().astype(float)
-    r = rsi(px)
-    s = stochastic(px)
-    b = bb_percent(px)
-    t = tsi(px)
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
-    comp = pd.concat([r, s, b, t], axis=1)
+def build_price_oscillator(px, smooth=9):
+    px = pd.to_numeric(px, errors="coerce").dropna().astype(float)
+    comp = pd.concat(
+        [
+            rsi(px, 14),
+            stochastic(px, 14),
+            bb_percent(px, 20),
+            tsi(px, 25, 13),
+        ],
+        axis=1,
+    )
     comp.columns = ["RSI", "Stoch", "BB%", "TSI"]
-    comp = comp.replace([np.inf, -np.inf], np.nan)
+    raw = comp.mean(axis=1, skipna=True)
+    osc = normalize(raw, lookback=200)
+    osc = ema(ema(osc, smooth), max(2, smooth // 2))
+    osc = osc.clip(0, 100)
+    sig = ema(osc, max(2, smooth // 2))
+    return pd.DataFrame({"price": px, "osc": osc, "signal": sig}).dropna()
 
-    score = comp.mean(axis=1, skipna=True)
-    score = normalize(score)
-    score = score.rolling(5).mean().clip(0, 100)
+def build_breadth_score(zip_file):
+    if zip_file is None:
+        return None
+    pieces = []
+    mapping = [
+        ("_Bpspx", 1),
+        ("_Bpnya", 1),
+        ("_nymo", 1),
+        ("_nySI", 1),
+        ("_nyad", 1),
+        ("_spxa50r", 1),
+        ("_trin", -1),
+        ("_cpce", -1),
+        ("vix", -1),
+    ]
+    for stem, direction in mapping:
+        s = load_series_from_zip(zip_file, stem, stem)
+        if s is None:
+            continue
+        col = s.columns[0]
+        vals = s[col].astype(float) * direction
+        vals = normalize(vals, lookback=200)
+        pieces.append(vals.rename(stem))
+    if not pieces:
+        return None
+    comp = pd.concat(pieces, axis=1).dropna(how="all")
+    breadth = comp.mean(axis=1, skipna=True)
+    breadth = ema(ema(breadth, 7), 4).clip(0, 100)
+    return breadth.rename("breadth")
 
-    return pd.DataFrame({"price": px, "osc": score}).dropna()
+def combine_price_and_breadth(price_df, breadth_score, breadth_weight=0.45, smooth=9):
+    out = price_df.copy()
+    if breadth_score is not None:
+        out = out.join(breadth_score, how="left")
+        out["breadth"] = out["breadth"].ffill()
+        pw = 1.0 - breadth_weight
+        out["osc"] = (pw * out["osc"] + breadth_weight * out["breadth"]).clip(0, 100)
+        out["signal"] = ema(out["osc"], max(2, smooth // 2))
+    return out.dropna()
 
-def backtest(df, long_th, short_th, hold=5):
-    px = df["price"].astype(float)
+def build_weekly_from_daily(daily_df, smooth=4):
+    wk = daily_df[["price"]].resample("W-FRI").last().dropna()
+    wk = build_price_oscillator(wk["price"], smooth=smooth)
+    return wk
+
+def backtest_crosses(df, long_th, short_th, hold=5):
     osc = df["osc"].astype(float)
-    px_ret = px.pct_change().fillna(0.0)
-
-    position = 0
+    px = df["price"].astype(float)
+    ret = px.pct_change().fillna(0.0)
+    pos = 0
     bars_left = 0
-    rets = []
-
-    for i in range(len(df)):
-        if position == 0:
-            if osc.iloc[i] >= long_th:
-                position = 1
+    out = []
+    for i in range(1, len(df)):
+        prev = osc.iloc[i-1]
+        cur = osc.iloc[i]
+        if pos == 0:
+            if prev < long_th and cur >= long_th:
+                pos = 1
                 bars_left = hold
-            elif osc.iloc[i] <= short_th:
-                position = -1
+            elif prev > short_th and cur <= short_th:
+                pos = -1
                 bars_left = hold
-
-        rets.append(px_ret.iloc[i] * position)
-
-        if position != 0:
+        out.append(ret.iloc[i] * pos)
+        if pos != 0:
             bars_left -= 1
             if bars_left <= 0:
-                position = 0
-
-    return (1 + pd.Series(rets, index=df.index)).cumprod()
+                pos = 0
+    return (1 + pd.Series(out, index=df.index[1:])).cumprod()
 
 price_df = load_rsp_history(symbol, years, zip_file)
 if price_df is None:
     st.error("Could not load history for RSP. Upload breadth zip containing rsp.csv.")
     st.stop()
 
-data = build_oscillator(price_df)
-if data.empty or len(data) < 250:
-    st.error("Loaded price history, but not enough valid numeric data remained after cleaning.")
+daily_price = build_price_oscillator(price_df["price"], smooth=daily_smooth)
+breadth_score = build_breadth_score(zip_file)
+daily = combine_price_and_breadth(daily_price, breadth_score, breadth_weight, smooth=daily_smooth)
+
+weekly = build_weekly_from_daily(price_df, smooth=weekly_smooth)
+if breadth_score is not None:
+    weekly_breadth = breadth_score.resample("W-FRI").last()
+    weekly = combine_price_and_breadth(weekly, weekly_breadth, breadth_weight, smooth=weekly_smooth)
+
+if daily.empty:
+    st.error("Not enough daily data after cleaning.")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["Oscillator", "Backtest Sweet Spots", "Monte Carlo", "Data Check"])
+tab1, tab2, tab3, tab4 = st.tabs(["Daily Oscillator", "Weekly Oscillator", "Backtest Sweet Spots", "Data Check"])
 
 with tab1:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data.index, y=data["osc"], name="Ultimate Oscillator"))
+    fig.add_trace(go.Scatter(x=daily.index, y=daily["osc"], name="Daily Ultimate Oscillator", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=daily.index, y=daily["signal"], name="Daily Signal", line=dict(width=1)))
     fig.add_hline(y=20)
     fig.add_hline(y=80)
     st.plotly_chart(fig, width="stretch")
-    st.caption(f"Rows used in oscillator: {len(data):,}")
+    st.caption(f"Daily rows used: {len(daily):,}")
 
 with tab2:
-    st.subheader("Threshold Sweet Spot Search")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=weekly.index, y=weekly["osc"], name="Weekly Ultimate Oscillator", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=weekly.index, y=weekly["signal"], name="Weekly Signal", line=dict(width=1)))
+    fig.add_hline(y=20)
+    fig.add_hline(y=80)
+    st.plotly_chart(fig, width="stretch")
+    st.caption(f"Weekly rows used: {len(weekly):,}")
+
+with tab3:
     long_candidates = [20, 22, 24, 26, 28, 30]
     short_candidates = [70, 72, 74, 76, 78, 80]
     hold_candidates = [3, 5, 8]
+    mode = st.selectbox("Backtest timeframe", ["Daily", "Weekly"])
+    bt_df = daily if mode == "Daily" else weekly
 
     results = []
     for long_th in long_candidates:
         for short_th in short_candidates:
             for hold in hold_candidates:
-                eq = backtest(data, long_th, short_th, hold=hold)
+                eq = backtest_crosses(bt_df, long_th, short_th, hold)
                 total = float(eq.iloc[-1]) if len(eq) else np.nan
-                results.append((long_th, short_th, hold, total))
-
-    res = pd.DataFrame(results, columns=["Long Trigger", "Short Trigger", "Hold Bars", "Return"])
+                results.append((mode, long_th, short_th, hold, total))
+    res = pd.DataFrame(results, columns=["Timeframe", "Long Trigger", "Short Trigger", "Hold Bars", "Return"])
     res["Return"] = pd.to_numeric(res["Return"], errors="coerce")
     res = res.dropna(subset=["Return"]).sort_values("Return", ascending=False).reset_index(drop=True)
     st.dataframe(res, width="stretch")
 
-    if len(res):
-        top = res.iloc[0]
-        st.write(f"Top combo: long {int(top['Long Trigger'])}, short {int(top['Short Trigger'])}, hold {int(top['Hold Bars'])}, terminal equity {top['Return']:.3f}")
-
-with tab3:
-    st.subheader("Monte Carlo Stress Test")
-    eq = backtest(data, 20, 80, hold=5)
-    rets = eq.pct_change().dropna()
-
-    sims = []
-    for _ in range(200):
-        r = rets.sample(frac=1, replace=True).reset_index(drop=True)
-        sims.append((1 + r).cumprod())
-
-    sims = pd.concat(sims, axis=1)
-    fig = go.Figure()
-    for col in sims.columns[:30]:
-        fig.add_trace(go.Scatter(y=sims[col], mode="lines", opacity=0.25, showlegend=False))
-    st.plotly_chart(fig, width="stretch")
-
 with tab4:
-    st.subheader("Data Check")
-    st.write("Loaded price head:")
+    st.write("Daily price head")
     st.dataframe(price_df.head(10), width="stretch")
-    st.write("Dtypes:")
-    st.write(price_df.dtypes.astype(str))
-    st.write("Cleaned oscillator frame head:")
-    st.dataframe(data.head(10), width="stretch")
+    if breadth_score is not None:
+        st.write("Breadth score head")
+        st.dataframe(breadth_score.head(10).to_frame(), width="stretch")
