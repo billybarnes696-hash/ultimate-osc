@@ -486,6 +486,184 @@ def build_signal_panel(df: pd.DataFrame) -> dict:
     }
 
 
+
+
+def build_repair_thrust_backtest_frame(cons_df: pd.DataFrame, rsp: pd.Series) -> pd.DataFrame:
+    if cons_df.empty or rsp is None or rsp.empty:
+        return pd.DataFrame()
+
+    work = pd.concat([cons_df.copy(), rsp.rename("RSP")], axis=1).dropna().copy()
+    if work.empty:
+        return work
+
+    osc = work["consensus_osc"]
+    cci = work["cci_prob_consensus"]
+    tsi = work["tsi_prob_consensus"]
+    bbp = work["bbp_prob_consensus"]
+
+    work["enter_probe"] = (
+        (osc.shift(1) <= 20) & (osc > 20) &
+        (cci > cci.shift(1)) &
+        (tsi >= tsi.shift(1))
+    )
+
+    work["enter_confirm"] = (
+        (osc.shift(1) <= 40) & (osc > 40) &
+        (bbp >= 50) &
+        (tsi > tsi.shift(1))
+    )
+
+    work["exit_fail_repair"] = (
+        (osc.shift(1) >= 40) & (osc < 40) &
+        (tsi < tsi.shift(1))
+    )
+
+    work["exit_exhaustion_fade"] = (
+        (osc.shift(1) >= 80) & (osc < 80)
+    )
+
+    work["exit_lost_repair"] = (
+        (osc.shift(1) >= 20) & (osc < 20)
+    )
+
+    return work
+
+
+def run_repair_thrust_backtest(cons_df: pd.DataFrame, rsp: pd.Series, initial_cash: float = 100_000.0, cost_per_trade_bps: float = 5.0):
+    work = build_repair_thrust_backtest_frame(cons_df, rsp)
+    if work.empty:
+        return None
+
+    work["Market_Return"] = work["RSP"].pct_change().fillna(0.0)
+
+    state = "cash"
+    position = []
+    signal = []
+    trade_log = []
+    entry_price = None
+    entry_date = None
+    entry_type = None
+
+    for i, (dt, row) in enumerate(work.iterrows()):
+        sig = "HOLD"
+        if state == "cash":
+            if bool(row["enter_probe"]):
+                state = "probe"
+                entry_price = float(row["RSP"])
+                entry_date = dt
+                entry_type = "PROBE"
+                sig = "BUY PROBE"
+            elif bool(row["enter_confirm"]):
+                state = "full"
+                entry_price = float(row["RSP"])
+                entry_date = dt
+                entry_type = "FULL"
+                sig = "BUY FULL"
+        elif state == "probe":
+            if bool(row["enter_confirm"]):
+                state = "full"
+                sig = "ADD CONFIRM"
+            elif bool(row["exit_lost_repair"]) or bool(row["exit_fail_repair"]):
+                sig = "EXIT FAIL"
+                if entry_price is not None:
+                    trade_log.append({
+                        "entry_date": entry_date,
+                        "exit_date": dt,
+                        "entry_type": entry_type,
+                        "entry_price": entry_price,
+                        "exit_price": float(row["RSP"]),
+                        "pnl": float(row["RSP"]) / entry_price - 1.0,
+                        "reason": "failed_repair"
+                    })
+                state = "cash"
+                entry_price = None
+                entry_date = None
+                entry_type = None
+        elif state == "full":
+            if bool(row["exit_exhaustion_fade"]):
+                sig = "EXIT EXHAUST"
+                if entry_price is not None:
+                    trade_log.append({
+                        "entry_date": entry_date,
+                        "exit_date": dt,
+                        "entry_type": entry_type,
+                        "entry_price": entry_price,
+                        "exit_price": float(row["RSP"]),
+                        "pnl": float(row["RSP"]) / entry_price - 1.0,
+                        "reason": "exhaustion_fade"
+                    })
+                state = "cash"
+                entry_price = None
+                entry_date = None
+                entry_type = None
+            elif bool(row["exit_fail_repair"]) or bool(row["exit_lost_repair"]):
+                sig = "EXIT LOST REPAIR"
+                if entry_price is not None:
+                    trade_log.append({
+                        "entry_date": entry_date,
+                        "exit_date": dt,
+                        "entry_type": entry_type,
+                        "entry_price": entry_price,
+                        "exit_price": float(row["RSP"]),
+                        "pnl": float(row["RSP"]) / entry_price - 1.0,
+                        "reason": "lost_repair"
+                    })
+                state = "cash"
+                entry_price = None
+                entry_date = None
+                entry_type = None
+
+        if state == "cash":
+            pos = 0.0
+        elif state == "probe":
+            pos = 0.35
+        else:
+            pos = 1.0
+
+        position.append(pos)
+        signal.append(sig)
+
+    work["Position"] = position
+    work["Signal"] = signal
+    work["Strategy_Return"] = work["Market_Return"] * work["Position"].shift(1).fillna(0.0)
+
+    pos_change = work["Position"].diff().abs().fillna(work["Position"])
+    cost_decimal = cost_per_trade_bps / 10000.0
+    work["Costs"] = pos_change * cost_decimal
+    work["Net_Strategy_Return"] = work["Strategy_Return"] - work["Costs"]
+
+    work["Strategy_Equity"] = (1.0 + work["Net_Strategy_Return"]).cumprod() * initial_cash
+    work["Buy_Hold_Equity"] = (1.0 + work["Market_Return"]).cumprod() * initial_cash
+
+    final_equity = float(work["Strategy_Equity"].iloc[-1])
+    total_return = final_equity / initial_cash - 1.0
+    days = max((work.index[-1] - work.index[0]).days, 1)
+    cagr = (final_equity / initial_cash) ** (365.0 / days) - 1.0
+    peak = work["Strategy_Equity"].cummax()
+    drawdown = (work["Strategy_Equity"] - peak) / peak
+    max_dd = float(drawdown.min())
+    rets = work["Net_Strategy_Return"].dropna()
+    sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() and rets.std() > 0 else 0.0
+
+    trades_df = pd.DataFrame(trade_log)
+    win_rate = float((trades_df["pnl"] > 0).mean()) if not trades_df.empty else np.nan
+
+    metrics = {
+        "Total Return": f"{total_return:.2%}",
+        "CAGR": f"{cagr:.2%}",
+        "Max Drawdown": f"{max_dd:.2%}",
+        "Sharpe Ratio": f"{sharpe:.2f}",
+        "Trades": int(len(trades_df)),
+        "Win Rate": f"{win_rate:.1%}" if pd.notna(win_rate) else "N/A",
+    }
+
+    return {
+        "work": work,
+        "equity_curve": work[["Strategy_Equity", "Buy_Hold_Equity", "Position", "Signal"]],
+        "trades": trades_df,
+        "metrics": metrics,
+    }
+
 def rsp_price_chart(rsp: pd.Series, bars: int, snapshot_entries_df: pd.DataFrame, timeframe: str) -> go.Figure:
     if rsp is None or rsp.empty:
         return go.Figure()
