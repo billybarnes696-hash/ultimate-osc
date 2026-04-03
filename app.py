@@ -1,23 +1,21 @@
+
 import io
 import zipfile
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, List, Any
-from functools import lru_cache
+from typing import Optional, Dict, List, Tuple
+from numbers import Real
 
 import numpy as np
 import pandas as pd
-import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import yfinance as yf
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import norm
 
 warnings.filterwarnings("ignore")
 
+
 # ============================================================================
-# CONFIGURATION & DATA CLASSES
+# CONFIGURATION / DATA CLASSES
 # ============================================================================
 
 @dataclass
@@ -26,491 +24,601 @@ class TradingCosts:
     slippage_bps: float = 2.0
     market_impact_bps: float = 5.0
     spread_bps: float = 1.0
-    
+
+    def __post_init__(self):
+        for field_name in ["commission", "slippage_bps", "market_impact_bps", "spread_bps"]:
+            val = getattr(self, field_name)
+            if not isinstance(val, Real) or val < 0:
+                raise ValueError(f"{field_name} must be a non-negative number, got {val}")
+
     def estimate_total_bps(self, position_size: float = 1.0) -> float:
-        return (self.slippage_bps + self.market_impact_bps * np.sqrt(position_size) 
-                + self.spread_bps + self.commission * 10000 / position_size)
+        if position_size <= 0:
+            return float("inf")
+        return (
+            self.slippage_bps
+            + self.market_impact_bps * np.sqrt(position_size)
+            + self.spread_bps
+            + self.commission * 10000 / max(position_size, 1e-9)
+        )
+
 
 @dataclass
 class RegimeThresholds:
-    bull_long: float = 16.0   # Enter Long here
-    bull_short: float = 84.0  # Exit to Cash here
-    bear_long: float = 21.0
-    bear_short: float = 79.0
-    sideways_long: float = 18.0
-    sideways_short: float = 82.0
+    long_enter: float = 18.0
+    long_exit: float = 45.0
+    short_enter: float = 82.0
+    short_exit: float = 55.0
+
 
 @dataclass
 class BacktestResult:
     returns: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    position: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     trades: pd.DataFrame = field(default_factory=pd.DataFrame)
     metrics: Dict[str, float] = field(default_factory=dict)
 
+
 # ============================================================================
-# QUANT MATH: BELL CURVE TRANSFORM
+# ROBUST NORMALIZATION
 # ============================================================================
 
 class BellCurveTransform:
+    """
+    Quantile-style oscillator on a 0-100 scale using rolling z-score -> Gaussian CDF.
+    Improvements vs the original:
+    - adaptive smoothing
+    - clipping of z-score tails
+    - explicit min history handling
+    """
     @staticmethod
-    def calculate(series: pd.Series, lookback: int = 252, sigma: float = 12.0) -> pd.Series:
-        vals = series.interpolate(limit_direction='both').ffill().bfill()
-        rolling_mean = vals.rolling(lookback, min_periods=int(lookback*0.8)).mean()
-        rolling_std = vals.rolling(lookback, min_periods=int(lookback*0.8)).std().clip(lower=1e-5)
-        z_score = (vals - rolling_mean) / rolling_std
-        bell_prob = norm.cdf(z_score)
-        bell_scaled = bell_prob * 100
-        smoothed = gaussian_filter1d(bell_scaled, sigma=sigma)
-        smoothed[np.isnan(vals.values)] = np.nan
-        return pd.Series(smoothed, index=series.index)
+    def calculate(
+        series: pd.Series,
+        lookback: int = 126,
+        sigma: float = 4.0,
+        z_clip: float = 3.5,
+        min_frac: float = 0.67,
+    ) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").copy()
+        s = s.interpolate(limit_direction="both").ffill().bfill()
+
+        rolling_mean = s.rolling(lookback, min_periods=max(20, int(lookback * min_frac))).mean()
+        rolling_std = s.rolling(lookback, min_periods=max(20, int(lookback * min_frac))).std()
+
+        z = (s - rolling_mean) / rolling_std.clip(lower=1e-8)
+        z = z.clip(lower=-z_clip, upper=z_clip)
+
+        cdf = norm.cdf(z) * 100.0
+
+        if sigma > 0:
+            smooth = gaussian_filter1d(cdf.to_numpy(dtype=float), sigma=sigma)
+            out = pd.Series(smooth, index=series.index)
+        else:
+            out = pd.Series(cdf, index=series.index)
+
+        out[rolling_mean.isna()] = np.nan
+        return out
+
 
 # ============================================================================
-# REGIME DETECTION
+# HELPER FUNCTIONS
+# ============================================================================
+
+def safe_zscore(series: pd.Series, lookback: int = 63) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.rolling(lookback, min_periods=max(10, lookback // 3)).mean()
+    sd = s.rolling(lookback, min_periods=max(10, lookback // 3)).std().clip(lower=1e-8)
+    z = (s - mu) / sd
+    return z.replace([np.inf, -np.inf], np.nan)
+
+
+def clip01(series: pd.Series, lo: float = 0.0, hi: float = 1.0) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").clip(lower=lo, upper=hi)
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").ewm(span=span, adjust=False).mean()
+
+
+def roc(series: pd.Series, periods: int) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    return s.pct_change(periods)
+
+
+# ============================================================================
+# REGIME DETECTOR
 # ============================================================================
 
 class RegimeDetector:
-    def detect_regime(self, price: pd.Series, returns: pd.Series) -> pd.Series:
-        momentum = price.pct_change(252).dropna()
-        vol_short = returns.rolling(20, min_periods=10).std() * np.sqrt(252)
-        vol_long = returns.rolling(252, min_periods=100).std() * np.sqrt(252)
-        vol_ratio = vol_short / vol_long.clip(lower=1e-5)
-        
-        features = pd.DataFrame({'momentum': momentum, 'vol_ratio': vol_ratio}).dropna()
-        if len(features) < 50:
-            return pd.Series('sideways', index=price.index)
-        
-        regime = pd.Series('sideways', index=features.index)
-        regime.loc[(features['momentum'] > 0.002) & (features['vol_ratio'] < 1.2)] = 'bull'
-        regime.loc[(features['momentum'] < -0.002) | (features['vol_ratio'] > 1.4)] = 'bear'
-        return regime.reindex(price.index).ffill()
+    """
+    Improved regime model:
+    - 252d trend
+    - 63d trend
+    - vol ratio
+    - drawdown state
+    """
+    def detect_regime(self, price: pd.Series) -> pd.Series:
+        px = pd.to_numeric(price, errors="coerce")
+        rets = px.pct_change()
 
-    def get_adaptive_thresholds(self, regime: str) -> RegimeThresholds:
-        thresholds = RegimeThresholds()
-        if regime == 'bull':
-            thresholds.bull_long = 16.0
-            thresholds.bull_short = 84.0
-        elif regime == 'bear':
-            thresholds.bull_long = 21.0  # Wider in bears to avoid catching knives
-            thresholds.bull_short = 79.0
-        else:
-            thresholds.bull_long = 18.0
-            thresholds.bull_short = 82.0
-        return thresholds
+        trend_252 = px / px.shift(252) - 1.0
+        trend_63 = px / px.shift(63) - 1.0
+
+        vol_short = rets.rolling(20, min_periods=10).std() * np.sqrt(252)
+        vol_long = rets.rolling(126, min_periods=60).std() * np.sqrt(252)
+        vol_ratio = vol_short / vol_long.clip(lower=1e-8)
+
+        dd = px / px.cummax() - 1.0
+
+        f = pd.DataFrame(
+            {
+                "trend_252": trend_252,
+                "trend_63": trend_63,
+                "vol_ratio": vol_ratio,
+                "drawdown": dd,
+            }
+        )
+
+        regime = pd.Series("sideways", index=px.index, dtype=object)
+        bull_mask = (
+            (f["trend_252"] > 0.03)
+            & (f["trend_63"] > -0.02)
+            & (f["vol_ratio"] < 1.20)
+            & (f["drawdown"] > -0.10)
+        )
+        bear_mask = (
+            (f["trend_252"] < -0.03)
+            | (f["trend_63"] < -0.06)
+            | (f["vol_ratio"] > 1.35)
+            | (f["drawdown"] < -0.15)
+        )
+
+        regime.loc[bull_mask] = "bull"
+        regime.loc[bear_mask] = "bear"
+        regime = regime.ffill().fillna("sideways")
+        return regime
+
+    def get_thresholds(self, regime: str) -> RegimeThresholds:
+        if regime == "bull":
+            return RegimeThresholds(long_enter=22.0, long_exit=48.0, short_enter=92.0, short_exit=60.0)
+        if regime == "bear":
+            return RegimeThresholds(long_enter=12.0, long_exit=35.0, short_enter=72.0, short_exit=50.0)
+        return RegimeThresholds(long_enter=18.0, long_exit=45.0, short_enter=82.0, short_exit=55.0)
+
 
 # ============================================================================
-# RISK MANAGEMENT
+# RISK MANAGER
 # ============================================================================
 
 class RiskManager:
-    def __init__(self, stop_loss_pct: float = 0.05, trailing_atr_mult: float = 2.0, target_vol: float = 0.15):
+    def __init__(self, stop_loss_pct: float = 0.06, target_vol: float = 0.15):
         self.stop_loss_pct = stop_loss_pct
-        self.trailing_atr_mult = trailing_atr_mult
-        self.target_vol = target_vol # Upped to 0.15 to match RSP natural vol
+        self.target_vol = target_vol
 
-    def volatility_scaled_size(self, current_vol: float) -> float:
-        if current_vol <= 0:
-            return 1.0
-        return min(1.0, self.target_vol / current_vol)
+    def volatility_scaled_size(self, current_vol: pd.Series) -> pd.Series:
+        cv = pd.to_numeric(current_vol, errors="coerce").replace(0, np.nan)
+        size = self.target_vol / cv
+        size = size.clip(lower=0.25, upper=1.00)
+        return size.fillna(1.0)
+
 
 # ============================================================================
-# ENHANCED OSCILLATOR
+# BREADTH THRUST / QUALITY LAYER
+# ============================================================================
+
+class BreadthThrustDetector:
+    """
+    Added because this is one of the most useful short-term rally detectors.
+    Works on the normalized breadth composite and selected participation series.
+    """
+    @staticmethod
+    def calculate(
+        breadth_osc: pd.Series,
+        spxa50r: Optional[pd.Series] = None,
+        bpspx: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        bo = pd.to_numeric(breadth_osc, errors="coerce")
+        impulse_5 = bo.diff(5)
+        impulse_10 = bo.diff(10)
+
+        thrust = pd.Series(0.0, index=bo.index)
+
+        thrust += (impulse_5 > 12).astype(float) * 0.40
+        thrust += (impulse_10 > 18).astype(float) * 0.35
+        thrust += ((bo > 35) & (bo.shift(3) < 20)).astype(float) * 0.25
+
+        if spxa50r is not None:
+            s50 = pd.to_numeric(spxa50r, errors="coerce")
+            thrust += ((s50 > 30) & (s50.diff(3) > 2)).astype(float) * 0.25
+
+        if bpspx is not None:
+            bp = pd.to_numeric(bpspx, errors="coerce")
+            thrust += ((bp.diff(5) > 1.5) | (bp > bp.rolling(20, min_periods=10).mean())).astype(float) * 0.15
+
+        thrust = thrust.clip(lower=0.0, upper=1.0)
+        return pd.DataFrame(
+            {
+                "thrust_score": thrust,
+                "impulse_5": impulse_5,
+                "impulse_10": impulse_10,
+            }
+        )
+
+
+# ============================================================================
+# ULTIMATE OSCILLATOR
 # ============================================================================
 
 class UltimateOscillator:
-    def __init__(self, daily_smooth: float = 12.0, weekly_smooth: float = 25.0):
-        self.daily_smooth = daily_smooth
-        self.weekly_smooth = weekly_smooth
+    """
+    Major upgrades vs the original:
+    1) lower lag smoothing
+    2) weighted breadth inputs instead of equal weight
+    3) optional SPXA200R support
+    4) quality/thrust overlay
+    5) price and breadth blended with explicit weights
+    """
 
-    def build_price_curve(self, price: pd.Series, smooth: float) -> pd.Series:
-        return BellCurveTransform.calculate(price, lookback=252, sigma=smooth)
+    def __init__(
+        self,
+        lookback: int = 126,
+        smooth_price: float = 4.0,
+        smooth_breadth: float = 4.0,
+        breadth_weight: float = 0.70,
+        price_weight: float = 0.30,
+    ):
+        self.lookback = lookback
+        self.smooth_price = smooth_price
+        self.smooth_breadth = smooth_breadth
+        self.breadth_weight = breadth_weight
+        self.price_weight = price_weight
 
-    def build_breadth_curve(self, zip_file, snapshot_map=None, snap_date=None) -> pd.Series:
-        if zip_file is None:
-            return pd.Series(dtype=float)
-            
-        config = [
-            ("_Bpspx", "RSP", 1.0, "raw"), ("_Bpnya", "RSP", 1.0, "raw"),
-            ("_nymo", "RSP", 1.0, "raw"), ("_nySI", "RSP", 1.0, "raw"),
-            ("_nyad", "RSP", 1.0, "diff"), ("_spxa50r", "RSP", 1.0, "raw"),
-            ("_trin", "RSP", -1.0, "raw"), ("_cpc", "RSP", -1.0, "raw"),     
-        ]
-        
-        pieces = []
-        with zipfile.ZipFile(zip_file) as z:
-            for stem, snap_sym, mult, trans in config:
-                matches = [n for n in z.namelist() if stem.lower() in n.lower() and n.lower().endswith(".csv")]
-                if not matches: continue
-                text = z.read(matches[0]).decode("utf-8", errors="ignore")
-                series = self._parse_sc_pipe_text(text)
-                if series is None: continue
-                
-                if snapshot_map is not None and snap_date is not None and stem in snapshot_map:
-                    series.loc[snap_date] = snapshot_map[stem]
-                if trans == "diff":
-                    series = series.diff()
-                series = series * mult
-                curve = BellCurveTransform.calculate(series, lookback=252, sigma=10.0)
-                pieces.append(curve.rename(stem))
-                
-        if not pieces: return pd.Series(dtype=float)
-        comp = pd.concat(pieces, axis=1).dropna(how='all')
-        return comp.mean(axis=1, skipna=True)
+        self.component_weights = {
+            "_spxa50r": 2.2,
+            "_spxa200r": 1.8,
+            "_Bpspx": 1.6,
+            "_Bpnya": 1.2,
+            "_nymo": 1.3,
+            "_nySI": 1.0,
+            "_nyad": 0.9,
+            "_trin": 0.7,
+            "_cpc": 0.7,
+        }
+
+    def build_price_curve(self, price: pd.Series) -> pd.Series:
+        return BellCurveTransform.calculate(
+            price,
+            lookback=self.lookback,
+            sigma=self.smooth_price,
+        )
 
     def _parse_sc_pipe_text(self, text: str) -> pd.Series:
-        lines = text.strip().split('\n')
+        lines = text.strip().split("\n")
         rows = []
         for line in lines:
-            parts = [p.strip() for p in line.split('|') if p.strip()]
+            parts = [p.strip() for p in line.split("|") if p.strip()]
             if len(parts) >= 5:
                 try:
-                    date = pd.to_datetime(parts[1])
+                    dt = pd.to_datetime(parts[1], errors="coerce")
                     close = float(parts[4])
-                    rows.append({'Date': date, 'Close': close})
-                except: continue
-        if not rows: return pd.Series(dtype=float)
-        df = pd.DataFrame(rows).set_index('Date')['Close']
-        df = df[~df.index.isna()].dropna().sort_index()
-        return df[~df.index.duplicated(keep='last')]
+                    if pd.notna(dt):
+                        rows.append((dt, close))
+                except Exception:
+                    pass
+
+        if not rows:
+            return pd.Series(dtype=float)
+
+        s = pd.Series({dt: close for dt, close in rows}).sort_index()
+        s = s[~s.index.duplicated(keep="last")]
+        return s.astype(float)
+
+    def load_zip_series(
+        self,
+        zip_bytes: bytes,
+        snapshot_map: Optional[Dict[str, float]] = None,
+        snap_date: Optional[pd.Timestamp] = None,
+    ) -> Dict[str, pd.Series]:
+        series_map: Dict[str, pd.Series] = {}
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+            for stem in self.component_weights:
+                matches = [n for n in names if stem.lower() in n.lower() and n.lower().endswith(".csv")]
+                if not matches:
+                    continue
+                text = zf.read(matches[0]).decode("utf-8", errors="ignore")
+                s = self._parse_sc_pipe_text(text)
+                if s.empty:
+                    continue
+
+                if snapshot_map is not None and snap_date is not None and stem in snapshot_map:
+                    s.loc[pd.Timestamp(snap_date)] = snapshot_map[stem]
+
+                series_map[stem] = s.sort_index()
+
+        return series_map
+
+    def _transform_component(self, stem: str, s: pd.Series) -> pd.Series:
+        x = pd.to_numeric(s, errors="coerce").copy()
+
+        if stem == "_nyad":
+            x = roc(x, 5)  # less noisy than raw diff
+        elif stem in ("_trin", "_cpc"):
+            x = -x  # polarity inversion
+        else:
+            x = x
+
+        return BellCurveTransform.calculate(
+            x,
+            lookback=self.lookback,
+            sigma=self.smooth_breadth,
+        )
+
+    def build_breadth_curve(
+        self,
+        zip_bytes: Optional[bytes],
+        snapshot_map: Optional[Dict[str, float]] = None,
+        snap_date: Optional[pd.Timestamp] = None,
+        return_details: bool = True,
+    ) -> Tuple[pd.Series, pd.DataFrame]:
+        if zip_bytes is None:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        raw_map = self.load_zip_series(zip_bytes, snapshot_map=snapshot_map, snap_date=snap_date)
+        transformed = {}
+        for stem, s in raw_map.items():
+            transformed[stem] = self._transform_component(stem, s)
+
+        if not transformed:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        comp_df = pd.concat(transformed, axis=1).sort_index()
+
+        weights = pd.Series(self.component_weights, dtype=float)
+        common_cols = [c for c in comp_df.columns if c in weights.index]
+        w = weights.loc[common_cols]
+
+        weighted_sum = comp_df[common_cols].multiply(w, axis=1).sum(axis=1, min_count=1)
+        weight_present = comp_df[common_cols].notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
+        breadth_curve = weighted_sum / weight_present
+
+        if return_details:
+            detail_df = comp_df.copy()
+            detail_df["breadth_curve"] = breadth_curve
+
+            thrust_df = BreadthThrustDetector.calculate(
+                breadth_curve,
+                spxa50r=raw_map.get("_spxa50r"),
+                bpspx=raw_map.get("_Bpspx"),
+            )
+            detail_df = detail_df.join(thrust_df, how="left")
+            return breadth_curve, detail_df
+
+        return breadth_curve, pd.DataFrame()
+
+    def blend_final_oscillator(
+        self,
+        price: pd.Series,
+        zip_bytes: Optional[bytes],
+        snapshot_map: Optional[Dict[str, float]] = None,
+        snap_date: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        price_curve = self.build_price_curve(price)
+        breadth_curve, detail_df = self.build_breadth_curve(
+            zip_bytes=zip_bytes,
+            snapshot_map=snapshot_map,
+            snap_date=snap_date,
+            return_details=True,
+        )
+
+        df = pd.concat(
+            {
+                "price": pd.to_numeric(price, errors="coerce"),
+                "price_curve": price_curve,
+                "breadth_curve": breadth_curve,
+            },
+            axis=1,
+        )
+
+        if not detail_df.empty:
+            df = df.join(detail_df, how="left")
+
+        df["final_osc"] = (
+            self.breadth_weight * df["breadth_curve"]
+            + self.price_weight * df["price_curve"]
+        )
+
+        # Quality score: reward strong breadth, punish weak participation
+        df["quality_score"] = 0.0
+        if "_spxa50r" in df.columns:
+            df["quality_score"] += ((df["_spxa50r"] > 30).astype(float) * 0.40)
+            df["quality_score"] += ((df["_spxa50r"] > 40).astype(float) * 0.20)
+        if "_Bpspx" in df.columns:
+            df["quality_score"] += ((df["_Bpspx"] > 20).astype(float) * 0.20)
+        if "thrust_score" in df.columns:
+            df["quality_score"] += df["thrust_score"].fillna(0) * 0.20
+
+        df["quality_score"] = df["quality_score"].clip(0, 1)
+        return df
+
 
 # ============================================================================
-# LONG/FLAT BACKTEST ENGINE
+# BACKTEST ENGINE
 # ============================================================================
 
 class QuantBacktestEngine:
-    def __init__(self, costs: TradingCosts = None, risk_mgr: RiskManager = None, regime_detector: RegimeDetector = None):
+    """
+    Long/flat engine using:
+    - adaptive regime thresholds
+    - quality gate
+    - thrust confirmation
+    - hysteresis (different enter/exit zones)
+    """
+
+    def __init__(
+        self,
+        costs: Optional[TradingCosts] = None,
+        risk_mgr: Optional[RiskManager] = None,
+        regime_detector: Optional[RegimeDetector] = None,
+        min_quality_for_long: float = 0.45,
+    ):
         self.costs = costs or TradingCosts()
         self.risk_mgr = risk_mgr or RiskManager()
         self.regime_detector = regime_detector or RegimeDetector()
+        self.min_quality_for_long = min_quality_for_long
 
-    def run_backtest(self, df: pd.DataFrame, regime_series: pd.Series = None) -> BacktestResult:
-        osc = df['osc'].astype(float)
-        px = df['price'].astype(float)
-        returns = px.pct_change().dropna()
-        
-        current_regime = 'sideways'
-        if regime_series is not None and len(regime_series) == len(df):
-            current_regime = regime_series.iloc[-1]
-        thresholds = self.regime_detector.get_adaptive_thresholds(current_regime)
-        
-        vol = returns.rolling(20, min_periods=10).std() * np.sqrt(252)
-        pos_size = self.risk_mgr.volatility_scaled_size(vol.fillna(self.risk_mgr.target_vol))
-        
-        trades = []
-        position = 0 # 0 = Cash, 1 = Long
-        entry_price = 0
-        entry_date = None
-        bars_held = 0
-        equity = [1.0]
-        daily_returns = []
-        atr = returns.rolling(14, min_periods=10).mean() * 1.0
-        
-        for i in range(1, len(df)):
-            current_price = px.iloc[i]
-            prev_price = px.iloc[i-1]
-            date = df.index[i]
-            
-            # 1. Check Stop Loss if Long
-            exit_signal = False
-            if position == 1:
-                bars_held += 1
-                pnl_pct = (current_price - entry_price) / entry_price
-                if pnl_pct <= -self.risk_mgr.stop_loss_pct:
-                    exit_signal = True
-                    
-            if exit_signal and position == 1:
-                trade_return = (current_price - entry_price) / entry_price - self.costs.estimate_total_bps() / 10000
-                trades.append({'entry_date': entry_date, 'exit_date': date, 'direction': 1, 'return': trade_return, 'bars_held': bars_held})
-                position = 0
-                bars_held = 0
-            
-            # 2. Signal Generation (Long / Flat)
-            if position == 0 and osc.iloc[i-1] < thresholds.bull_long and osc.iloc[i] >= thresholds.bull_long:
-                position = 1
-                entry_price = current_price
-                entry_date = date
-                bars_held = 0
-            elif position == 1 and osc.iloc[i-1] < thresholds.bull_short and osc.iloc[i] >= thresholds.bull_short:
-                # Exit to CASH when hitting overbought
-                trade_return = (current_price - entry_price) / entry_price - self.costs.estimate_total_bps() / 10000
-                trades.append({'entry_date': entry_date, 'exit_date': date, 'direction': 1, 'return': trade_return, 'bars_held': bars_held})
-                position = 0
-                bars_held = 0
-                
-            # 3. Calculate Daily Return (0 if in cash)
-            daily_ret = (current_price - prev_price) / prev_price * position * pos_size.iloc[i]
-            daily_returns.append(daily_ret)
-            equity.append(equity[-1] * (1 + daily_ret))
-            
-        returns_series = pd.Series(daily_returns, index=df.index[1:])
-        equity_curve = pd.Series(equity, index=df.index[:len(equity)])
-        trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
-        metrics = self._calculate_metrics(returns_series, equity_curve, trades_df)
-        
-        return BacktestResult(returns=returns_series, equity_curve=equity_curve, trades=trades_df, metrics=metrics)
-    
-    def _calculate_metrics(self, returns: pd.Series, equity: pd.Series, trades: pd.DataFrame) -> Dict[str, float]:
-        if len(returns) == 0: return {}
-        total_ret = equity.iloc[-1] - 1
-        ann_ret = (1 + total_ret) ** (252 / len(returns)) - 1
-        vol = returns.std() * np.sqrt(252)
-        sharpe = ann_ret / vol if vol > 0 else 0
-        peak = equity.expanding().max()
-        max_dd = ((peak - equity) / peak).max()
-        downside = returns[returns < 0]
-        down_dev = downside.std() * np.sqrt(252) if len(downside) > 0 else vol
-        sortino = ann_ret / down_dev if down_dev > 0 else 0
-        
-        if len(trades) > 0:
-            win_rate = (trades['return'] > 0).mean()
-            avg_win = trades['return'][trades['return'] > 0].mean() if any(trades['return'] > 0) else 0
-            avg_loss = trades['return'][trades['return'] < 0].mean() if any(trades['return'] < 0) else 0
-            profit_factor = abs(avg_win * win_rate / (avg_loss * (1 - win_rate))) if avg_loss != 0 else 0
-            avg_hold = trades['bars_held'].mean()
-        else:
-            win_rate, avg_win, avg_loss, profit_factor, avg_hold = 0, 0, 0, 0, 0
+    @staticmethod
+    def _performance_metrics(equity: pd.Series, returns: pd.Series, trades: pd.DataFrame) -> Dict[str, float]:
+        if equity.empty:
+            return {}
 
+        total_return = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
+        ann_return = float((equity.iloc[-1] / equity.iloc[0]) ** (252 / max(len(equity), 1)) - 1.0)
+        ann_vol = float(returns.std() * np.sqrt(252)) if len(returns) > 1 else np.nan
+        sharpe = float(ann_return / ann_vol) if ann_vol and ann_vol > 0 else np.nan
+        drawdown = equity / equity.cummax() - 1.0
+        max_dd = float(drawdown.min()) if not drawdown.empty else np.nan
+        win_rate = float((trades["pnl"] > 0).mean()) if not trades.empty else np.nan
         return {
-            'total_return': total_ret, 'annual_return': ann_ret, 'volatility': vol,
-            'sharpe_ratio': sharpe, 'sortino_ratio': sortino, 'max_drawdown': max_dd,
-            'win_rate': win_rate, 'profit_factor': profit_factor, 'avg_holding_bars': avg_hold,
-            'num_trades': len(trades)
+            "total_return": total_return,
+            "annual_return": ann_return,
+            "annual_vol": ann_vol,
+            "sharpe": sharpe,
+            "max_drawdown": max_dd,
+            "trade_count": float(len(trades)),
+            "win_rate": win_rate,
         }
 
+    def run_backtest(self, df: pd.DataFrame) -> BacktestResult:
+        work = df.copy()
+        work["price"] = pd.to_numeric(work["price"], errors="coerce")
+        work["final_osc"] = pd.to_numeric(work["final_osc"], errors="coerce")
+        work["quality_score"] = pd.to_numeric(work.get("quality_score", 0.0), errors="coerce").fillna(0.0)
+        work["thrust_score"] = pd.to_numeric(work.get("thrust_score", 0.0), errors="coerce").fillna(0.0)
+
+        work = work.dropna(subset=["price", "final_osc"]).copy()
+        if len(work) < 50:
+            return BacktestResult()
+
+        regime = self.regime_detector.detect_regime(work["price"])
+        rets = work["price"].pct_change().fillna(0.0)
+        vol = rets.rolling(20, min_periods=10).std() * np.sqrt(252)
+        size = self.risk_mgr.volatility_scaled_size(vol)
+
+        position = pd.Series(0.0, index=work.index)
+        strat_returns = pd.Series(0.0, index=work.index)
+        trades = []
+
+        in_pos = False
+        entry_px = np.nan
+        entry_dt = None
+
+        for i in range(1, len(work)):
+            dt = work.index[i]
+            prev_dt = work.index[i - 1]
+            osc = float(work["final_osc"].iloc[i])
+            q = float(work["quality_score"].iloc[i])
+            thrust = float(work["thrust_score"].iloc[i])
+            bar_regime = regime.iloc[i]
+
+            th = self.regime_detector.get_thresholds(bar_regime)
+
+            enter_long = (osc <= th.long_enter) and (q >= self.min_quality_for_long or thrust >= 0.60)
+            exit_long = (osc >= th.long_exit) or (q < 0.20 and thrust < 0.20)
+
+            if not in_pos and enter_long:
+                in_pos = True
+                entry_px = work["price"].iloc[i]
+                entry_dt = dt
+                trade_cost = self.costs.estimate_total_bps(position_size=float(size.iloc[i])) / 10000.0
+                strat_returns.iloc[i] -= trade_cost
+
+            elif in_pos and exit_long:
+                exit_px = work["price"].iloc[i]
+                pnl = exit_px / entry_px - 1.0
+                trades.append(
+                    {
+                        "entry_date": entry_dt,
+                        "exit_date": dt,
+                        "entry_price": entry_px,
+                        "exit_price": exit_px,
+                        "pnl": pnl,
+                        "regime_at_entry": regime.loc[entry_dt] if entry_dt in regime.index else np.nan,
+                    }
+                )
+                in_pos = False
+                entry_px = np.nan
+                entry_dt = None
+                trade_cost = self.costs.estimate_total_bps(position_size=float(size.iloc[i])) / 10000.0
+                strat_returns.iloc[i] -= trade_cost
+
+            position.iloc[i] = 1.0 if in_pos else 0.0
+            strat_returns.iloc[i] += rets.iloc[i] * position.iloc[i] * float(size.iloc[i])
+
+        equity = (1.0 + strat_returns.fillna(0.0)).cumprod()
+        trades_df = pd.DataFrame(trades)
+        metrics = self._performance_metrics(equity, strat_returns, trades_df)
+
+        return BacktestResult(
+            returns=strat_returns,
+            equity_curve=equity,
+            position=position,
+            trades=trades_df,
+            metrics=metrics,
+        )
+
+
 # ============================================================================
-# MONTE CARLO SIMULATION ENGINE
+# SIGNAL SUMMARY
 # ============================================================================
 
-class MonteCarloEngine:
-    def __init__(self, n_sims=1000, sim_years=5):
-        self.n_sims = n_sims
-        self.sim_years = sim_years
-        self.trading_days = int(252 * sim_years)
+def summarize_current_signal(df: pd.DataFrame, regime_detector: Optional[RegimeDetector] = None) -> Dict[str, object]:
+    if df.empty:
+        return {}
 
-    def run(self, strategy_returns: pd.Series, benchmark_returns: pd.Series) -> pd.DataFrame:
-        # Align and clean data
-        df = pd.DataFrame({'strat': strategy_returns, 'bench': benchmark_returns}).dropna()
-        if len(df) < 252: return pd.DataFrame()
-        
-        results = []
-        for _ in range(self.n_sims):
-            # Bootstrap sample with replacement
-            sample = df.sample(self.trading_days, replace=True)
-            
-            strat_cum = (1 + sample['strat']).cumprod()
-            bench_cum = (1 + sample['bench']).cumprod()
-            
-            strat_dd = ((strat_cum.expanding().max() - strat_cum) / strat_cum.expanding().max()).max()
-            bench_dd = ((bench_cum.expanding().max() - bench_cum) / bench_cum.expanding().max()).max()
-            
-            results.append({
-                'strat_return': strat_cum.iloc[-1] - 1,
-                'bench_return': bench_cum.iloc[-1] - 1,
-                'alpha': (strat_cum.iloc[-1] - 1) - (bench_cum.iloc[-1] - 1),
-                'strat_max_dd': strat_dd,
-                'bench_max_dd': bench_dd
-            })
-            
-        return pd.DataFrame(results)
+    rd = regime_detector or RegimeDetector()
+    regime = rd.detect_regime(df["price"])
+    last_idx = df.index[-1]
+    last_regime = regime.loc[last_idx]
+    th = rd.get_thresholds(last_regime)
 
-# ============================================================================
-# DATA LOADERS
-# ============================================================================
+    osc = float(df["final_osc"].iloc[-1])
+    q = float(df.get("quality_score", pd.Series(0.0, index=df.index)).iloc[-1])
+    thrust = float(df.get("thrust_score", pd.Series(0.0, index=df.index)).iloc[-1])
 
-def load_snapshot_map(snapshot_file):
-    if snapshot_file is None: return None, None
-    raw_text = snapshot_file.getvalue().decode("utf-8", errors="ignore")
-    lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
-    symbol_map = {"$NYMO": "_nymo", "$CPCE": "_cpc", "$SPXA50R": "_spxa50r", "$BPSPX": "_Bpspx", "$BPNYA": "_Bpnya", "$NYSI": "_nySI", "$NYAD": "_nyad", "$TRIN": "_trin", "RSP": "RSP"}
-    mapping = {}
-    for line in lines:
-        parts = [p.strip() for p in line.split('|') if p.strip()]
-        if len(parts) < 9 or parts[1] == "Symbol": continue
-        sym, close_val_str = parts[1], parts[8]
-        try: close_val = float(close_val_str)
-        except ValueError: continue
-        mapping[symbol_map.get(sym, sym.replace("$", ""))] = close_val
-    return (mapping, pd.Timestamp.today().normalize()) if mapping else (None, None)
+    if osc <= th.long_enter and (q >= 0.45 or thrust >= 0.60):
+        state = "LONG"
+    elif osc >= th.short_enter:
+        state = "RISK-OFF / TAKE PROFITS"
+    else:
+        state = "HOLD / NEUTRAL"
 
-def load_price_history(symbol, years, zip_file, snapshot_map, snap_date):
-    if zip_file is not None:
-        try: zip_file.seek(0)
-        except: pass
-        with zipfile.ZipFile(zip_file) as z:
-            matches = [n for n in z.namelist() if symbol.lower() in n.lower() and n.lower().endswith(".csv")]
-            if matches:
-                series = UltimateOscillator._parse_sc_pipe_text(z.read(matches[0]).decode("utf-8", errors="ignore"))
-                if series is not None:
-                    if snapshot_map and snap_date and symbol in snapshot_map:
-                        series.loc[snap_date] = float(snapshot_map[symbol]); series = series.sort_index()
-                    if len(series) > 50: return series.rename("price")
-    try:
-        df = yf.download(symbol, period=f"{years}y", progress=False, auto_adjust=False)
-        if len(df) > 0:
-            s = df[("Close", symbol)] if isinstance(df.columns, pd.MultiIndex) and ("Close", symbol) in df.columns else df.iloc[:, 0]
-            out = pd.DataFrame({"price": pd.to_numeric(s, errors="coerce")}, index=pd.to_datetime(df.index)).dropna()
-            if snapshot_map and snap_date and symbol in snapshot_map:
-                out.loc[snap_date, "price"] = float(snapshot_map[symbol]); out = out.sort_index()
-            return out if len(out) > 50 else None
-    except: return None
+    return {
+        "date": last_idx,
+        "regime": last_regime,
+        "state": state,
+        "final_osc": osc,
+        "quality_score": q,
+        "thrust_score": thrust,
+        "long_enter_threshold": th.long_enter,
+        "long_exit_threshold": th.long_exit,
+        "short_enter_threshold": th.short_enter,
+        "short_exit_threshold": th.short_exit,
+    }
 
-def resample_weekly(price_hist): return price_hist.resample("W-FRI").last().dropna()
 
 # ============================================================================
-# MAIN APP
+# EXAMPLE USAGE
 # ============================================================================
-
-def main():
-    st.set_page_config(page_title="RSP Tactical Bell Curve", layout="wide")
-    st.title("📊 RSP Tactical Bell Curve (Long/Flat)")
-    st.markdown("Replaces Short signals with Cash. Includes Monte Carlo vs Buy & Hold proof.")
-    
-    st.sidebar.header("Config")
-    symbol = st.sidebar.text_input("ETF Symbol", "RSP")
-    years = st.sidebar.slider("Historical lookback", 5, 25, 20)
-    breadth_weight = st.sidebar.slider("Breadth Weight", 0.0, 1.0, 0.40, 0.05)
-    daily_smooth = st.sidebar.slider("Daily Gaussian Sigma", 5.0, 25.0, 12.0)
-    weekly_smooth = st.sidebar.slider("Weekly Gaussian Sigma", 10.0, 50.0, 25.0)
-    
-    st.sidebar.subheader("Risk Parameters")
-    stop_loss = st.sidebar.slider("Stop Loss %", 0.02, 0.15, 0.05)
-    target_vol = st.sidebar.slider("Target Volatility", 0.05, 0.25, 0.15)
-    
-    st.sidebar.subheader("Monte Carlo Config")
-    mc_sims = st.sidebar.slider("MC Simulations", 100, 2000, 1000, step=100)
-    mc_years = st.sidebar.slider("MC Sim Years", 1, 10, 5)
-    
-    st.sidebar.subheader("1. Historical Data (Zip)")
-    zip_file = st.sidebar.file_uploader("Upload Breadth History (.zip)", type="zip", key="zip_uploader")
-    st.sidebar.subheader("2. Daily Snapshot")
-    snap_file = st.sidebar.file_uploader("Upload End-of-Day Snapshot (.csv)", type="csv", key="snap_uploader")
-    
-    view_options = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730, "5Y": 1825, "10Y": 3650, "Max": None}
-    view_choice = st.sidebar.selectbox("View Window", list(view_options.keys()), index=4)
-    
-    snapshot_map, snap_date = load_snapshot_map(snap_file)
-    price_hist = load_price_history(symbol, years, zip_file, snapshot_map, snap_date)
-    
-    if price_hist is None:
-        st.error("Failed to load price history.")
-        st.stop()
-        
-    osc = UltimateOscillator(daily_smooth, weekly_smooth)
-    
-    with st.spinner("Building Bell Curves & Running Backtests..."):
-        daily_price_curve = osc.build_price_curve(price_hist["price"], smooth=daily_smooth)
-        breadth_curve = osc.build_breadth_curve(zip_file, snapshot_map, snap_date)
-        
-        ultimate_daily = pd.DataFrame({"price": price_hist["price"]})
-        if breadth_curve is not None and len(breadth_curve) > 0:
-            breadth_aligned = breadth_curve.reindex(price_hist.index)
-            ultimate_daily["osc"] = ((1 - breadth_weight) * osc.build_price_curve(price_hist["price"], daily_smooth) + breadth_weight * breadth_aligned).clip(0, 100)
-        else:
-            ultimate_daily["osc"] = osc.build_price_curve(price_hist["price"], daily_smooth)
-            
-        ultimate_daily["signal"] = gaussian_filter1d(ultimate_daily["osc"].fillna(50), sigma=daily_smooth)
-        ultimate_daily = ultimate_daily.dropna(subset=['osc', 'signal'])
-            
-        returns = price_hist["price"].pct_change().dropna()
-        regime_engine = RegimeDetector()
-        regime_series = regime_engine.detect_regime(price_hist["price"], returns)
-        
-        risk_mgr = RiskManager(stop_loss_pct=stop_loss, trailing_atr_mult=2.0, target_vol=target_vol)
-        bt_engine = QuantBacktestEngine(TradingCosts(), risk_mgr, regime_engine)
-        daily_bt = bt_engine.run_backtest(ultimate_daily, regime_series=regime_series)
-        
-        # Calculate Buy & Hold baseline for MC comparison
-        bh_returns = price_hist["price"].pct_change().reindex(daily_bt.returns.index).dropna()
-        
-        # Run Monte Carlo
-        mc_engine = MonteCarloEngine(n_sims=mc_sims, sim_years=mc_years)
-        mc_results = mc_engine.run(daily_bt.returns, bh_returns)
-        
-    # --- DASHBOARD TABS ---
-    tab1, tab2, tab3 = st.tabs(["📈 Daily Oscillator", "🎲 Monte Carlo vs B&H", "🎯 Trade Log"])
-    
-    with tab1:
-        col1, col2, col3, col4, col5 = st.columns(5)
-        current_regime = regime_series.iloc[-1]
-        regime_color = {"bull": "🟢", "bear": "🔴", "sideways": "🟡"}.get(current_regime, "⚪")
-        
-        with col1: st.metric("Current Osc", f"{ultimate_daily['osc'].iloc[-1]:.1f}")
-        with col2: st.metric("Regime", f"{regime_color} {current_regime.upper()}")
-        with col3: st.metric("Strategy CAGR", f"{daily_bt.metrics.get('annual_return', 0):.2%}")
-        with col4: st.metric("Max Drawdown", f"{daily_bt.metrics.get('max_drawdown', 0):.2%}")
-        with col5: st.metric("Win Rate", f"{daily_bt.metrics.get('win_rate', 0)*100:.1f}%")
-            
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-        dvp = ultimate_daily.copy()
-        if view_choice != "Max": dvp = dvp[dvp.index >= dvp.index.max() - pd.Timedelta(days=view_options[view_choice])]
-            
-        fig.add_hrect(y0=0, y1=15.86, fillcolor="rgba(220,38,38,0.15)", line_width=0, row=1, col=1)
-        fig.add_hrect(y0=84.13, y1=100, fillcolor="rgba(34,197,94,0.15)", line_width=0, row=1, col=1)
-        fig.add_hline(y=15.86, line_dash="dash", line_color="red", row=1, col=1)
-        fig.add_hline(y=84.13, line_dash="dash", line_color="green", row=1, col=1)
-        
-        fig.add_trace(go.Scatter(x=dvp.index, y=dvp["osc"], name="Ultimate Osc", line=dict(width=2.5, color="#FF6B6B"), row=1, col=1))
-        fig.add_trace(go.Scatter(x=dvp.index, y=dvp["signal"], name="Signal", line=dict(width=1.5, color="#4ECDC4", dash="dash"), row=1, col=1))
-        
-        price_view = price_hist[price_hist.index >= dvp.index[0]]
-        fig.add_trace(go.Scatter(x=price_view.index, y=price_view["price"], name="RSP Price", line=dict(width=1.5, color="#95A5A6"), row=2, col=1))
-                            
-        fig.update_layout(height=800, showlegend=True, title_text="Daily Bell Curve (Long/Flat Tactical)")
-        fig.update_yaxes(title_text="Oscillator (0-100)", range=[0, 100], row=1, col=1)
-        fig.update_yaxes(title_text="RSP Price", row=2, col=1)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        st.subheader(f"Monte Carlo Proof: {mc_sims} Simulations of {mc_years} Years")
-        
-        if mc_results is not None and len(mc_results) > 0:
-            beat_bh = (mc_results['alpha'] > 0).mean()
-            avg_alpha = mc_results['alpha'].mean()
-            avg_strat_dd = mc_results['strat_max_dd'].mean()
-            avg_bh_dd = mc_results['bench_max_dd'].mean()
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Prob. of Beating B&H", f"{beat_bh*100:.1f}%", delta=f"{avg_alpha*100:.2f}% Avg Alpha")
-            c2.metric("Avg Strategy Max DD", f"{avg_strat_dd:.2%}", delta=f"{(avg_bh_dd - avg_strat_dd)*100:.2f}% vs B&H", delta_color="normal")
-            c3.metric("Avg B&H Max DD", f"{avg_bh_dd:.2%}")
-            c4.metric("Strategy Edge", "Positive" if avg_alpha > 0 else "Negative")
-            
-            fig_mc = make_subplots(rows=1, cols=2, subplot_titles=('Terminal Wealth Distribution', 'Max Drawdown Distribution'))
-            
-            fig_mc.add_trace(go.Histogram(x=mc_results['strat_return']*100, name='Strategy', marker_color='#4ECDC4', opacity=0.7), row=1, col=1)
-            fig_mc.add_trace(go.Histogram(x=mc_results['bench_return']*100, name='Buy & Hold', marker_color='#FF6B6B', opacity=0.7), row=1, col=1)
-            
-            fig_mc.add_trace(go.Histogram(x=mc_results['strat_max_dd']*100, name='Strategy DD', marker_color='#4ECDC4', opacity=0.7), row=1, col=2)
-            fig_mc.add_trace(go.Histogram(x=mc_results['bench_max_dd']*100, name='B&H DD', marker_color='#FF6B6B', opacity=0.7), row=1, col=2)
-            
-            fig_mc.update_layout(height=500, showlegend=True)
-            fig_mc.update_xaxes(title_text="Return %", row=1, col=1)
-            fig_mc.update_xaxes(title_text="Drawdown %", row=1, col=2)
-            st.plotly_chart(fig_mc, use_container_width=True)
-        else:
-            st.warning("Not enough historical data to run Monte Carlo simulation.")
-
-    with tab3:
-        st.subheader("Strategy Trade Log (Long to Flat)")
-        if len(daily_bt.trades) > 0:
-            st.dataframe(daily_bt.trades.sort_values(by='exit_date', ascending=False), use_container_width=True)
-        else:
-            st.info("No trades generated in the backtest period.")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Return", f"{daily_bt.metrics.get('total_return', 0):.2%}")
-        c2.metric("Sharpe Ratio", f"{daily_bt.metrics.get('sharpe_ratio', 0):.2f}")
-        c3.metric("Sortino Ratio", f"{daily_bt.metrics.get('sortino_ratio', 0):.2f}")
-        c4.metric("Profit Factor", f"{daily_bt.metrics.get('profit_factor', 0):.2f}")
-            
-        st.subheader("Strategy Equity Curve vs Buy & Hold")
-        
-        # Plot both curves overlaid
-        bh_equity = (1 + bh_returns).cumprod()
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(x=daily_bt.equity_curve.index, y=daily_bt.equity_curve, name='Tactical Strategy', line=dict(width=2.5, color='#4ECDC4')))
-        fig_eq.add_trace(go.Scatter(x=bh_equity.index, y=bh_equity, name='Buy & Hold RSP', line=dict(width=2, color='#95A5A6', dash='dot')))
-        fig_eq.update_layout(height=500, title_text="Equity Curve Comparison")
-        st.plotly_chart(fig_eq, use_container_width=True)
 
 if __name__ == "__main__":
-    main()
+    # Example placeholder:
+    # price = pd.read_csv("rsp.csv", parse_dates=["Date"]).set_index("Date")["Close"]
+    # with open("breadth_history.zip", "rb") as f:
+    #     zip_bytes = f.read()
+    # uo = UltimateOscillator()
+    # df = uo.blend_final_oscillator(price=price, zip_bytes=zip_bytes)
+    # bt = QuantBacktestEngine().run_backtest(df)
+    # print(bt.metrics)
+    pass
