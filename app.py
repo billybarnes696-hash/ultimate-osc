@@ -15,7 +15,7 @@ from pandas.tseries.offsets import BDay
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import norm
 
-st.set_page_config(page_title="Consensus Bell Curve Oscillator", layout="wide")
+st.set_page_config(page_title="Consensus Bell Curve Oscillator v3", layout="wide")
 
 STATE_LADDER = [
     (0, 10, "Washout", "#7f1d1d"),
@@ -28,12 +28,11 @@ STATE_LADDER = [
 
 DATA_DIR = Path("app_state")
 DATA_DIR.mkdir(exist_ok=True)
-SNAPSHOT_LOG_PATH = DATA_DIR / "consensus_snapshot_log.csv"
+SNAPSHOT_LOG_PATH = DATA_DIR / "consensus_snapshot_log_v3.csv"
 
 
 @dataclass
 class SeriesConfig:
-    # importance across breadth figures
     series_weights: Dict[str, float] = field(default_factory=lambda: {
         "SPXA50R": 1.50,
         "BPSPX": 1.40,
@@ -53,6 +52,17 @@ class SeriesConfig:
 
 def clamp01(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").clip(lower=0.0, upper=1.0)
+
+
+def serialize_series(series: pd.Series) -> Tuple[Tuple[str, ...], Tuple[float, ...]]:
+    idx = tuple(pd.Index(series.index).strftime("%Y-%m-%d"))
+    vals = tuple(float(x) if pd.notna(x) else np.nan for x in pd.to_numeric(series, errors="coerce").values)
+    return idx, vals
+
+
+def deserialize_series(payload: Tuple[Tuple[str, ...], Tuple[float, ...]]) -> pd.Series:
+    idx, vals = payload
+    return pd.Series(vals, index=pd.to_datetime(list(idx))).sort_index()
 
 
 def parse_stockcharts_history_text(text: str) -> pd.Series:
@@ -78,8 +88,9 @@ def parse_stockcharts_history_text(text: str) -> pd.Series:
     return s.astype(float)
 
 
-def load_zip_bundle(zip_bytes: bytes) -> Dict[str, pd.Series]:
-    bundle: Dict[str, pd.Series] = {}
+@st.cache_data(show_spinner=False)
+def load_zip_bundle_cached(zip_bytes: bytes) -> Dict[str, Tuple[Tuple[str, ...], Tuple[float, ...]]]:
+    bundle: Dict[str, Tuple[Tuple[str, ...], Tuple[float, ...]]] = {}
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for name in zf.namelist():
             if not name.lower().endswith(".csv"):
@@ -88,8 +99,13 @@ def load_zip_bundle(zip_bytes: bytes) -> Dict[str, pd.Series]:
             text = zf.read(name).decode("utf-8", errors="ignore")
             s = parse_stockcharts_history_text(text)
             if not s.empty:
-                bundle[stem] = s
+                bundle[stem] = serialize_series(s)
     return bundle
+
+
+def load_zip_bundle(zip_bytes: bytes) -> Dict[str, pd.Series]:
+    raw = load_zip_bundle_cached(zip_bytes)
+    return {k: deserialize_series(v) for k, v in raw.items()}
 
 
 def parse_snapshot_csv(file_bytes: bytes) -> Dict[str, float]:
@@ -209,12 +225,10 @@ def bell_curve_transform(series: pd.Series, lookback: int = 100, sigma: float = 
 
 
 def cci_to_prob(cci_line: pd.Series) -> pd.Series:
-    # -200 -> 0, 0 -> 0.5, +200 -> 1
     return clamp01((cci_line + 200.0) / 400.0)
 
 
 def tsi_to_prob(tsi_line: pd.Series, tsi_signal: pd.Series) -> pd.Series:
-    # base level + hook/cross behavior
     level = clamp01((tsi_line + 25.0) / 50.0)
     spread = tsi_line - tsi_signal
     hook = clamp01((spread + 10.0) / 20.0)
@@ -222,21 +236,20 @@ def tsi_to_prob(tsi_line: pd.Series, tsi_signal: pd.Series) -> pd.Series:
 
 
 def bbp_to_prob(bbp_line: pd.Series) -> pd.Series:
-    # reflect the gates you wanted:
-    # <.05 washout, >.20 repair, >.50 thrust, >.80 exhaustion
     return clamp01(bbp_line)
+
+
+def timeframe_params(timeframe: str) -> Tuple[int, int, int, int, int, int, float]:
+    if timeframe == "Weekly":
+        return 14, 13, 7, 7, 20, 52, 2.6
+    if timeframe == "Hourly":
+        return 14, 12, 6, 6, 20, 63, 1.6
+    return 20, 25, 13, 7, 20, 84, 2.0
 
 
 def calculate_individual_consensus(series: pd.Series, cfg: SeriesConfig, timeframe: str) -> pd.DataFrame:
     x = pd.to_numeric(series, errors="coerce").dropna().sort_index()
-    if timeframe == "Weekly":
-        x = x.resample("W-FRI").last().dropna()
-        cci_len, tsi_fast, tsi_slow, tsi_sig, bb_len, final_lookback, final_sigma = 14, 13, 7, 7, 20, 52, 2.8
-    elif timeframe == "Hourly":
-        # user asked for hourly, but with daily uploads we treat hourly as a faster timing view of the daily consensus
-        cci_len, tsi_fast, tsi_slow, tsi_sig, bb_len, final_lookback, final_sigma = 14, 12, 6, 6, 20, 63, 1.8
-    else:
-        cci_len, tsi_fast, tsi_slow, tsi_sig, bb_len, final_lookback, final_sigma = 20, 25, 13, 7, 20, 100, 2.2
+    cci_len, tsi_fast, tsi_slow, tsi_sig, bb_len, final_lookback, final_sigma = timeframe_params(timeframe)
 
     cci_line = cci(x, cci_len)
     tsi_line, tsi_signal = tsi(x, tsi_fast, tsi_slow, tsi_sig)
@@ -253,73 +266,148 @@ def calculate_individual_consensus(series: pd.Series, cfg: SeriesConfig, timefra
     )
     osc = bell_curve_transform(raw, lookback=final_lookback, sigma=final_sigma)
 
-    out = pd.DataFrame({
-        "series": x,
-        "cci": cci_line,
-        "tsi": tsi_line,
-        "tsi_signal": tsi_signal,
-        "bbp": bbp_line,
+    return pd.DataFrame({
+        "raw_prob": raw,
+        "osc": osc,
         "cci_prob": cci_prob,
         "tsi_prob": tsi_prob,
         "bbp_prob": bbp_prob,
-        "raw_prob": raw,
-        "osc": osc,
     })
-    return out
 
 
-def build_consensus(bundle: Dict[str, pd.Series], cfg: SeriesConfig, timeframe: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    processed: Dict[str, pd.DataFrame] = {}
+@st.cache_data(show_spinner=False)
+def build_daily_consensus_cached(
+    zip_bytes: bytes,
+    snapshot_payload_json: str,
+    anchor_date_str: str,
+    cfg_dict: dict,
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    cfg = SeriesConfig(**cfg_dict)
+    base_bundle = load_zip_bundle(zip_bytes)
 
-    for stem, ser in bundle.items():
+    snapshot_payload = json.loads(snapshot_payload_json)
+    snapshot_entries = []
+    ordered = sorted(snapshot_payload, key=lambda x: (x["sequence"], x["filename"]))
+    for i, info in enumerate(ordered):
+        snap_date = pd.Timestamp(anchor_date_str) if i == 0 else next_business_day(snapshot_entries[-1]["assigned_date"])
+        snap_map = info["snapshot_map"]
+        snapshot_entries.append({
+            "filename": info["filename"],
+            "sequence": info["sequence"],
+            "assigned_date": snap_date,
+            "snapshot_map": snap_map,
+        })
+
+    stem_alias_map = {
+        "_spxa50r": display_name_to_snapshot_aliases("SPXA50R"),
+        "_Bpspx": display_name_to_snapshot_aliases("BPSPX"),
+        "_Bpnya": display_name_to_snapshot_aliases("BPNYA"),
+        "_nymo": display_name_to_snapshot_aliases("NYMO"),
+        "_nySI": display_name_to_snapshot_aliases("NYSI"),
+        "_nyad": display_name_to_snapshot_aliases("NYAD"),
+        "_trin": display_name_to_snapshot_aliases("TRIN"),
+        "_cpce": display_name_to_snapshot_aliases("CPCE"),
+        "_cpc": display_name_to_snapshot_aliases("CPCE"),
+        "_oexa50r": display_name_to_snapshot_aliases("OEXA50R"),
+        "_spxadp": display_name_to_snapshot_aliases("SPXADP"),
+    }
+
+    updated = {k: v.copy() for k, v in base_bundle.items()}
+    for entry in snapshot_entries:
+        snap_date = pd.Timestamp(entry["assigned_date"])
+        snap_map = entry["snapshot_map"]
+        for stem, aliases in stem_alias_map.items():
+            if stem in updated:
+                val = snapshot_value(snap_map, *aliases)
+                if val is not None:
+                    updated[stem].loc[snap_date] = float(val)
+                    updated[stem] = updated[stem].sort_index()
+                    updated[stem] = updated[stem][~updated[stem].index.duplicated(keep="last")]
+
+    processed = {}
+    for stem, ser in updated.items():
         name = stem_to_display_name(stem)
         if name not in cfg.series_weights:
             continue
         base = normalize_for_direction(ser, name)
         if len(base.dropna()) < 30:
             continue
-        processed[name] = calculate_individual_consensus(base, cfg, timeframe)
+        processed[name] = calculate_individual_consensus(base, cfg, "Daily")
 
     if not processed:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), pd.DataFrame(), json.dumps([])
 
-    osc_cols = []
-    raw_cols = []
-    weights = {}
-    for name, df in processed.items():
-        osc_cols.append(df["osc"].rename(name))
-        raw_cols.append(df["raw_prob"].rename(name))
-        weights[name] = cfg.series_weights.get(name, 1.0)
+    weights = pd.Series({name: cfg.series_weights[name] for name in processed.keys()}, dtype=float)
 
-    osc_df = pd.concat(osc_cols, axis=1).sort_index()
-    raw_df = pd.concat(raw_cols, axis=1).sort_index()
-    w = pd.Series(weights, dtype=float)
+    raw_df = pd.concat([df["raw_prob"].rename(name) for name, df in processed.items()], axis=1).sort_index()
+    cci_df = pd.concat([df["cci_prob"].rename(name) for name, df in processed.items()], axis=1).sort_index()
+    tsi_df = pd.concat([df["tsi_prob"].rename(name) for name, df in processed.items()], axis=1).sort_index()
+    bbp_df = pd.concat([df["bbp_prob"].rename(name) for name, df in processed.items()], axis=1).sort_index()
 
-    weighted_osc = osc_df.multiply(w, axis=1).sum(axis=1, min_count=1) / osc_df.notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
-    weighted_raw = raw_df.multiply(w, axis=1).sum(axis=1, min_count=1) / raw_df.notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
+    weighted_raw = raw_df.multiply(weights, axis=1).sum(axis=1, min_count=1) / raw_df.notna().multiply(weights, axis=1).sum(axis=1).replace(0, np.nan)
+    cci_cons = cci_df.multiply(weights, axis=1).sum(axis=1, min_count=1) / cci_df.notna().multiply(weights, axis=1).sum(axis=1).replace(0, np.nan)
+    tsi_cons = tsi_df.multiply(weights, axis=1).sum(axis=1, min_count=1) / tsi_df.notna().multiply(weights, axis=1).sum(axis=1).replace(0, np.nan)
+    bbp_cons = bbp_df.multiply(weights, axis=1).sum(axis=1, min_count=1) / bbp_df.notna().multiply(weights, axis=1).sum(axis=1).replace(0, np.nan)
 
-    # final smoothing / bell-curve on the consensus itself
-    if timeframe == "Weekly":
-        final_consensus = bell_curve_transform(weighted_raw, lookback=39, sigma=2.5)
-    elif timeframe == "Hourly":
-        final_consensus = bell_curve_transform(weighted_raw, lookback=63, sigma=1.5)
-    else:
-        final_consensus = bell_curve_transform(weighted_raw, lookback=84, sigma=2.0)
-
-    cci_prob_cons = pd.concat([df["cci_prob"].rename(name) for name, df in processed.items()], axis=1).multiply(w, axis=1).sum(axis=1, min_count=1) / pd.concat([df["cci_prob"].rename(name) for name, df in processed.items()], axis=1).notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
-    tsi_prob_cons = pd.concat([df["tsi_prob"].rename(name) for name, df in processed.items()], axis=1).multiply(w, axis=1).sum(axis=1, min_count=1) / pd.concat([df["tsi_prob"].rename(name) for name, df in processed.items()], axis=1).notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
-    bbp_prob_cons = pd.concat([df["bbp_prob"].rename(name) for name, df in processed.items()], axis=1).multiply(w, axis=1).sum(axis=1, min_count=1) / pd.concat([df["bbp_prob"].rename(name) for name, df in processed.items()], axis=1).notna().multiply(w, axis=1).sum(axis=1).replace(0, np.nan)
-
-    summary = pd.DataFrame({
+    daily_summary = pd.DataFrame({
         "raw_prob": weighted_raw,
-        "avg_component_osc": weighted_osc,
-        "consensus_osc": final_consensus,
-        "cci_prob_consensus": cci_prob_cons * 100.0,
-        "tsi_prob_consensus": tsi_prob_cons * 100.0,
-        "bbp_prob_consensus": bbp_prob_cons * 100.0,
+        "consensus_osc": bell_curve_transform(weighted_raw, lookback=84, sigma=2.0),
+        "cci_prob_consensus": cci_cons * 100.0,
+        "tsi_prob_consensus": tsi_cons * 100.0,
+        "bbp_prob_consensus": bbp_cons * 100.0,
     }).sort_index()
 
-    return summary, processed
+    stamped_rows = []
+    for entry in snapshot_entries:
+        dt = pd.Timestamp(entry["assigned_date"])
+        if len(daily_summary.dropna()) == 0:
+            continue
+        if dt in daily_summary.index:
+            row = daily_summary.loc[dt]
+        else:
+            pos = daily_summary.index.get_indexer([dt], method="nearest")[0]
+            row = daily_summary.iloc[pos]
+        stamped_rows.append({
+            "filename": entry["filename"],
+            "sequence": entry["sequence"],
+            "assigned_date": str(dt.date()),
+            "consensus_osc": round(float(row["consensus_osc"]), 2),
+            "cci_layer": round(float(row["cci_prob_consensus"]), 2),
+            "tsi_layer": round(float(row["tsi_prob_consensus"]), 2),
+            "bbp_layer": round(float(row["bbp_prob_consensus"]), 2),
+        })
+    stamped_df = pd.DataFrame(stamped_rows)
+    entries_json = json.dumps([
+        {
+            "filename": e["filename"],
+            "sequence": e["sequence"],
+            "assigned_date": str(pd.Timestamp(e["assigned_date"]).date()),
+            "symbol_count": len(e["snapshot_map"]),
+        }
+        for e in snapshot_entries
+    ])
+    return daily_summary, stamped_df, entries_json
+
+
+@st.cache_data(show_spinner=False)
+def derive_weekly_from_daily(daily_df: pd.DataFrame) -> pd.DataFrame:
+    if daily_df.empty:
+        return pd.DataFrame()
+    weekly = daily_df.resample("W-FRI").last().dropna(how="all")
+    weekly["consensus_osc"] = bell_curve_transform(weekly["raw_prob"], lookback=39, sigma=2.5)
+    return weekly
+
+
+@st.cache_data(show_spinner=False)
+def derive_hourly_like_from_daily(daily_df: pd.DataFrame) -> pd.DataFrame:
+    if daily_df.empty:
+        return pd.DataFrame()
+    hourly = daily_df.copy()
+    hourly["consensus_osc"] = bell_curve_transform(hourly["raw_prob"], lookback=63, sigma=1.4)
+    hourly["cci_prob_consensus"] = bell_curve_transform(hourly["cci_prob_consensus"], lookback=63, sigma=1.1)
+    hourly["tsi_prob_consensus"] = bell_curve_transform(hourly["tsi_prob_consensus"], lookback=63, sigma=1.1)
+    hourly["bbp_prob_consensus"] = bell_curve_transform(hourly["bbp_prob_consensus"], lookback=63, sigma=1.1)
+    return hourly
 
 
 def ladder_state(score: float) -> Tuple[str, str]:
@@ -340,75 +428,21 @@ def trim_df(df: pd.DataFrame, bars: int) -> pd.DataFrame:
     return df.iloc[-bars:].copy()
 
 
-def append_snapshot_log(entries: List[Dict]):
-    if not entries:
+def append_snapshot_log(entries_df: pd.DataFrame):
+    if entries_df.empty:
         return
-    rows = []
-    for e in entries:
-        rows.append({
-            "filename": e["filename"],
-            "sequence": e["sequence"],
-            "assigned_date": str(pd.Timestamp(e["assigned_date"]).date()),
-            "symbol_count": len(e["snapshot_map"]),
-            "symbols_json": json.dumps(e["snapshot_map"]),
-        })
-    new_df = pd.DataFrame(rows)
     if SNAPSHOT_LOG_PATH.exists():
         old = pd.read_csv(SNAPSHOT_LOG_PATH)
-        combo = pd.concat([old, new_df], ignore_index=True).drop_duplicates(subset=["filename", "assigned_date"], keep="last")
+        combo = pd.concat([old, entries_df], ignore_index=True).drop_duplicates(subset=["filename", "assigned_date"], keep="last")
     else:
-        combo = new_df
+        combo = entries_df.copy()
     combo.to_csv(SNAPSHOT_LOG_PATH, index=False)
 
 
 def load_snapshot_log() -> pd.DataFrame:
     if SNAPSHOT_LOG_PATH.exists():
         return pd.read_csv(SNAPSHOT_LOG_PATH)
-    return pd.DataFrame(columns=["filename", "sequence", "assigned_date", "symbol_count", "symbols_json"])
-
-
-def patch_bundle_with_snapshots(base_bundle: Dict[str, pd.Series], snapshot_entries: List[Dict]) -> Dict[str, pd.Series]:
-    updated = {k: v.copy() for k, v in base_bundle.items()}
-    stem_alias_map = {
-        "_spxa50r": display_name_to_snapshot_aliases("SPXA50R"),
-        "_Bpspx": display_name_to_snapshot_aliases("BPSPX"),
-        "_Bpnya": display_name_to_snapshot_aliases("BPNYA"),
-        "_nymo": display_name_to_snapshot_aliases("NYMO"),
-        "_nySI": display_name_to_snapshot_aliases("NYSI"),
-        "_nyad": display_name_to_snapshot_aliases("NYAD"),
-        "_trin": display_name_to_snapshot_aliases("TRIN"),
-        "_cpce": display_name_to_snapshot_aliases("CPCE"),
-        "_cpc": display_name_to_snapshot_aliases("CPCE"),
-        "_oexa50r": display_name_to_snapshot_aliases("OEXA50R"),
-        "_spxadp": display_name_to_snapshot_aliases("SPXADP"),
-    }
-    for entry in snapshot_entries:
-        snap_date = pd.Timestamp(entry["assigned_date"])
-        snap_map = entry["snapshot_map"]
-        for stem, aliases in stem_alias_map.items():
-            if stem in updated:
-                val = snapshot_value(snap_map, *aliases)
-                if val is not None:
-                    updated[stem].loc[snap_date] = float(val)
-                    updated[stem] = updated[stem].sort_index()
-                    updated[stem] = updated[stem][~updated[stem].index.duplicated(keep="last")]
-    return updated
-
-
-def build_with_snapshots(base_bundle: Dict[str, pd.Series], snapshot_files_info: List[Dict], anchor_date: pd.Timestamp):
-    snapshot_entries = []
-    ordered = sorted(snapshot_files_info, key=lambda x: (x["sequence"], x["filename"]))
-    for i, info in enumerate(ordered):
-        snap_date = pd.Timestamp(anchor_date) if i == 0 else next_business_day(snapshot_entries[-1]["assigned_date"])
-        snap_map = parse_snapshot_csv(info["bytes"])
-        snapshot_entries.append({
-            "filename": info["filename"],
-            "sequence": info["sequence"],
-            "assigned_date": snap_date,
-            "snapshot_map": snap_map,
-        })
-    updated_bundle = patch_bundle_with_snapshots(base_bundle, snapshot_entries)
-    return updated_bundle, snapshot_entries
+    return pd.DataFrame(columns=["filename", "sequence", "assigned_date", "symbol_count"])
 
 
 def render_state_ladder(score: float):
@@ -442,7 +476,7 @@ def render_state_ladder(score: float):
     )
 
 
-def consensus_chart(df: pd.DataFrame, bars: int, timeframe: str, snapshot_entries: List[Dict]) -> go.Figure:
+def consensus_chart(df: pd.DataFrame, bars: int, timeframe: str, snapshot_entries_df: pd.DataFrame) -> go.Figure:
     plot_df = trim_df(df, bars)
     fig = go.Figure()
 
@@ -453,52 +487,33 @@ def consensus_chart(df: pd.DataFrame, bars: int, timeframe: str, snapshot_entrie
             text=label, showarrow=False, xanchor="left", font=dict(size=11, color=color)
         )
 
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df["consensus_osc"],
-        mode="lines", name=f"{timeframe} Consensus Osc",
-        line=dict(width=3)
-    ))
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df["cci_prob_consensus"],
-        mode="lines", name="CCI layer",
-        line=dict(width=1.8, dash="dash")
-    ))
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df["tsi_prob_consensus"],
-        mode="lines", name="TSI layer",
-        line=dict(width=1.8, dash="dot")
-    ))
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df["bbp_prob_consensus"],
-        mode="lines", name="%B layer",
-        line=dict(width=1.8, dash="longdash")
-    ))
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["consensus_osc"], mode="lines", name=f"{timeframe} Consensus Osc", line=dict(width=3)))
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["cci_prob_consensus"], mode="lines", name="CCI layer", line=dict(width=1.8, dash="dash")))
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["tsi_prob_consensus"], mode="lines", name="TSI layer", line=dict(width=1.8, dash="dot")))
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["bbp_prob_consensus"], mode="lines", name="%B layer", line=dict(width=1.8, dash="longdash")))
 
     if not plot_df.empty:
-        last_x = plot_df.index[-1]
-        last_y = float(plot_df["consensus_osc"].iloc[-1])
         fig.add_trace(go.Scatter(
-            x=[last_x], y=[last_y], mode="markers",
-            marker=dict(size=11, symbol="diamond"),
-            name="Current"
+            x=[plot_df.index[-1]], y=[float(plot_df["consensus_osc"].iloc[-1])],
+            mode="markers", marker=dict(size=11, symbol="diamond"), name="Current"
         ))
 
-    # timestamp uploaded daily snapshots directly on the chart
-    for entry in snapshot_entries:
-        dt = pd.Timestamp(entry["assigned_date"])
-        if len(plot_df) == 0 or dt < plot_df.index.min() or dt > plot_df.index.max():
-            continue
-        nearest_idx = plot_df.index.get_indexer([dt], method="nearest")[0]
-        y = float(plot_df["consensus_osc"].iloc[nearest_idx])
-        label = f"{dt.date()} · SC {entry['sequence']}"
-        fig.add_vline(x=dt, line_dash="dot", line_width=1, opacity=0.45)
-        fig.add_annotation(
-            x=dt, y=y, text=label, showarrow=True, arrowhead=2,
-            ay=-35, font=dict(size=10), bgcolor="rgba(255,255,255,0.85)"
-        )
+    if not snapshot_entries_df.empty:
+        for _, entry in snapshot_entries_df.iterrows():
+            dt = pd.Timestamp(entry["assigned_date"])
+            if len(plot_df) == 0 or dt < plot_df.index.min() or dt > plot_df.index.max():
+                continue
+            nearest_idx = plot_df.index.get_indexer([dt], method="nearest")[0]
+            y = float(plot_df["consensus_osc"].iloc[nearest_idx])
+            label = f"{dt.date()} · SC {entry['sequence']}"
+            fig.add_vline(x=dt, line_dash="dot", line_width=1, opacity=0.45)
+            fig.add_annotation(
+                x=dt, y=y, text=label, showarrow=True, arrowhead=2,
+                ay=-35, font=dict(size=10), bgcolor="rgba(255,255,255,0.85)"
+            )
 
     fig.update_layout(
-        title=f"{timeframe} Consensus Bell Curve Oscillator",
+        title=f"{timeframe} Consensus Bell Curve Oscillator v3",
         height=560,
         yaxis_title="0–100 Score",
         yaxis=dict(range=[0, 100]),
@@ -509,8 +524,8 @@ def consensus_chart(df: pd.DataFrame, bars: int, timeframe: str, snapshot_entrie
     return fig
 
 
-st.title("Consensus Bell Curve Oscillator")
-st.caption("True consensus of individually normalized breadth oscillators. CCI first, then TSI, then %B.")
+st.title("Consensus Bell Curve Oscillator v3")
+st.caption("Faster version: cache-heavy, daily-first build, then derive hourly/weekly from daily. Daily uploads are timestamped onto charts and tables.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -525,36 +540,57 @@ with st.sidebar:
     chart_window = st.selectbox("Chart window", ["3M", "6M", "1Y", "2Y", "5Y", "10Y", "Max"], index=2)
     persist_log = st.checkbox("Save snapshot log to app_state", value=False)
 
+    st.header("Performance")
+    compact_mode = st.checkbox("Compact mode (lighter tables)", value=True)
+
 if breadth_zip is None:
     st.info("Upload your historical ZIP first, then your daily snapshot CSV file(s).")
     st.stop()
 
 cfg = SeriesConfig()
-base_bundle = load_zip_bundle(breadth_zip.getvalue())
-
-files_info = []
+snapshot_payload = []
 if snapshot_files:
     for f in snapshot_files:
         seq = parse_sequence_number(f.name)
-        files_info.append({"filename": f.name, "sequence": seq if seq is not None else 999999, "bytes": f.getvalue()})
+        snapshot_payload.append({
+            "filename": f.name,
+            "sequence": seq if seq is not None else 999999,
+            "snapshot_map": parse_snapshot_csv(f.getvalue()),
+        })
 
-working_bundle, snapshot_entries = build_with_snapshots(base_bundle, files_info, pd.Timestamp(anchor_date))
+daily_df, stamped_df, entries_json = build_daily_consensus_cached(
+    breadth_zip.getvalue(),
+    json.dumps(snapshot_payload, sort_keys=True),
+    str(pd.Timestamp(anchor_date).date()),
+    {
+        "series_weights": cfg.series_weights,
+        "cci_weight": cfg.cci_weight,
+        "tsi_weight": cfg.tsi_weight,
+        "bbp_weight": cfg.bbp_weight,
+    },
+)
 
-if persist_log and snapshot_entries:
-    append_snapshot_log(snapshot_entries)
+if daily_df.empty:
+    st.error("No usable series were found in the ZIP after normalization.")
+    st.stop()
 
-tabs = st.tabs(["Hourly", "Daily", "Weekly", "Snapshot Log", "Breakdown"])
+entries_df = pd.DataFrame(json.loads(entries_json))
+if persist_log and not entries_df.empty:
+    append_snapshot_log(entries_df)
 
+weekly_df = derive_weekly_from_daily(daily_df)
+hourly_df = derive_hourly_like_from_daily(daily_df)
+
+tabs = st.tabs(["Hourly", "Daily", "Weekly", "Snapshot Log", "Notes"])
 bars = bars_from_label(chart_window)
 
-for tf, tab in zip(["Hourly", "Daily", "Weekly"], tabs[:3]):
+for tf, df, tab in [
+    ("Hourly", hourly_df, tabs[0]),
+    ("Daily", daily_df, tabs[1]),
+    ("Weekly", weekly_df, tabs[2]),
+]:
     with tab:
-        summary_df, processed = build_consensus(working_bundle, cfg, tf)
-        if summary_df.empty:
-            st.warning(f"No usable series found for {tf}.")
-            continue
-
-        last = summary_df.dropna().iloc[-1]
+        last = df.dropna().iloc[-1]
         state, _ = ladder_state(float(last["consensus_osc"]))
 
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -564,58 +600,78 @@ for tf, tab in zip(["Hourly", "Daily", "Weekly"], tabs[:3]):
         c4.metric("TSI Layer", f"{float(last['tsi_prob_consensus']):.1f}")
         c5.metric("%B Layer", f"{float(last['bbp_prob_consensus']):.1f}")
 
-        if snapshot_entries:
-            latest_snap = max(pd.Timestamp(e["assigned_date"]) for e in snapshot_entries)
+        if not entries_df.empty:
+            latest_snap = pd.to_datetime(entries_df["assigned_date"]).max()
             st.caption(f"Latest stamped upload date in model: **{latest_snap.date()}**")
         else:
-            latest_snap = None
             st.caption("No daily snapshot uploads stamped yet.")
 
         render_state_ladder(float(last["consensus_osc"]))
-        st.plotly_chart(consensus_chart(summary_df, bars, tf, snapshot_entries), use_container_width=True)
+        st.plotly_chart(consensus_chart(df, bars, tf, entries_df), use_container_width=True)
 
-        # show the stamped dates and values numerically
-        if snapshot_entries:
-            rows = []
-            for entry in snapshot_entries:
-                dt = pd.Timestamp(entry["assigned_date"])
-                if dt in summary_df.index:
-                    row = summary_df.loc[dt]
-                else:
-                    if len(summary_df.dropna()) == 0:
+        if not stamped_df.empty and tf in {"Hourly", "Daily", "Weekly"}:
+            st.subheader(f"{tf} stamped upload readings")
+            local = stamped_df.copy()
+            if tf == "Weekly":
+                temp = []
+                for _, row in local.iterrows():
+                    dt = pd.Timestamp(row["assigned_date"])
+                    if len(weekly_df.dropna()) == 0:
                         continue
-                    nearest_pos = summary_df.index.get_indexer([dt], method="nearest")[0]
-                    row = summary_df.iloc[nearest_pos]
-                rows.append({
-                    "filename": entry["filename"],
-                    "sequence": entry["sequence"],
-                    "assigned_date": str(dt.date()),
-                    "consensus_osc": round(float(row["consensus_osc"]), 2),
-                    "cci_layer": round(float(row["cci_prob_consensus"]), 2),
-                    "tsi_layer": round(float(row["tsi_prob_consensus"]), 2),
-                    "bbp_layer": round(float(row["bbp_prob_consensus"]), 2),
-                })
-            if rows:
-                st.subheader(f"{tf} stamped upload readings")
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    pos = weekly_df.index.get_indexer([dt], method="nearest")[0]
+                    r = weekly_df.iloc[pos]
+                    temp.append({
+                        "filename": row["filename"],
+                        "sequence": row["sequence"],
+                        "assigned_date": row["assigned_date"],
+                        "consensus_osc": round(float(r["consensus_osc"]), 2),
+                        "cci_layer": round(float(r["cci_prob_consensus"]), 2),
+                        "tsi_layer": round(float(r["tsi_prob_consensus"]), 2),
+                        "bbp_layer": round(float(r["bbp_prob_consensus"]), 2),
+                    })
+                local = pd.DataFrame(temp)
+            elif tf == "Hourly":
+                temp = []
+                for _, row in local.iterrows():
+                    dt = pd.Timestamp(row["assigned_date"])
+                    if len(hourly_df.dropna()) == 0:
+                        continue
+                    pos = hourly_df.index.get_indexer([dt], method="nearest")[0]
+                    r = hourly_df.iloc[pos]
+                    temp.append({
+                        "filename": row["filename"],
+                        "sequence": row["sequence"],
+                        "assigned_date": row["assigned_date"],
+                        "consensus_osc": round(float(r["consensus_osc"]), 2),
+                        "cci_layer": round(float(r["cci_prob_consensus"]), 2),
+                        "tsi_layer": round(float(r["tsi_prob_consensus"]), 2),
+                        "bbp_layer": round(float(r["bbp_prob_consensus"]), 2),
+                    })
+                local = pd.DataFrame(temp)
+            if compact_mode:
+                st.dataframe(local.tail(12), use_container_width=True)
+            else:
+                st.dataframe(local, use_container_width=True)
 
 with tabs[3]:
     st.subheader("Current upload assignment")
-    current_log = pd.DataFrame([{
-        "filename": e["filename"],
-        "sequence": e["sequence"],
-        "assigned_date": e["assigned_date"].date(),
-        "symbol_count": len(e["snapshot_map"]),
-    } for e in snapshot_entries])
-    st.dataframe(current_log if not current_log.empty else pd.DataFrame(columns=["filename", "sequence", "assigned_date", "symbol_count"]), use_container_width=True)
-
+    st.dataframe(entries_df if not entries_df.empty else pd.DataFrame(columns=["filename", "sequence", "assigned_date", "symbol_count"]), use_container_width=True)
     st.subheader("Saved historical log")
     st.dataframe(load_snapshot_log(), use_container_width=True)
 
 with tabs[4]:
-    st.subheader("Per-series weights")
-    st.dataframe(pd.DataFrame({
-        "series": list(cfg.series_weights.keys()),
-        "weight": list(cfg.series_weights.values())
-    }), use_container_width=True)
-    st.caption("Final consensus = weighted average of per-series oscillators, after each series is separately normalized.")
+    st.markdown(
+        """
+**What changed in v3**
+- Builds the **daily consensus once**
+- Derives **weekly** from daily resampling
+- Derives **hourly-like timing** from the same daily raw consensus
+- Adds `st.cache_data` around the expensive parts
+- Keeps timestamped daily uploads on charts and in tables
+
+**Core model**
+- Per-series normalized oscillator first
+- Then weighted breadth consensus
+- CCI first, then TSI, then %B
+        """
+    )
