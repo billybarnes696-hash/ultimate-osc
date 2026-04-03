@@ -218,8 +218,9 @@ def bell_curve_transform(series: pd.Series, lookback: int = 100, sigma: float = 
     mean_ = x.rolling(lookback, min_periods=min_periods).mean()
     std_ = x.rolling(lookback, min_periods=min_periods).std().clip(lower=1e-8)
     z = ((x - mean_) / std_).clip(-z_clip, z_clip)
-    cdf = norm.cdf(z) * 100.0
-    out = pd.Series(gaussian_filter1d(cdf.fillna(50.0).to_numpy(dtype=float), sigma=sigma), index=x.index)
+    cdf = pd.Series(norm.cdf(z) * 100.0, index=x.index)
+    arr = cdf.fillna(50.0).to_numpy(dtype=float)
+    out = pd.Series(gaussian_filter1d(arr, sigma=sigma), index=x.index)
     out[mean_.isna()] = np.nan
     return out
 
