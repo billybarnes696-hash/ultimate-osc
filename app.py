@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 from pandas.tseries.offsets import BDay
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import norm
@@ -411,6 +412,150 @@ def derive_hourly_like_from_daily(daily_df: pd.DataFrame) -> pd.DataFrame:
     return hourly
 
 
+
+
+@st.cache_data(show_spinner=False)
+def fetch_rsp_history(period: str = "5y") -> pd.Series:
+    df = yf.download("RSP", period=period, auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("Close", "RSP") in df.columns:
+            s = df[("Close", "RSP")]
+        elif ("Adj Close", "RSP") in df.columns:
+            s = df[("Adj Close", "RSP")]
+        else:
+            s = df.iloc[:, 0]
+    else:
+        if "Close" in df.columns:
+            s = df["Close"]
+        elif "Adj Close" in df.columns:
+            s = df["Adj Close"]
+        else:
+            s = df.iloc[:, 0]
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    s.name = "RSP"
+    return s
+
+
+def build_signal_panel(df: pd.DataFrame) -> dict:
+    if df.empty or len(df.dropna()) < 3:
+        return {}
+    clean = df.dropna().copy()
+    last = clean.iloc[-1]
+    prev = clean.iloc[-2]
+    osc = float(last["consensus_osc"])
+    prev_osc = float(prev["consensus_osc"])
+    state, _ = ladder_state(osc)
+
+    slope_3 = float(clean["consensus_osc"].iloc[-1] - clean["consensus_osc"].iloc[max(0, len(clean)-4)])
+    cci_layer = float(last["cci_prob_consensus"])
+    tsi_layer = float(last["tsi_prob_consensus"])
+    bbp_layer = float(last["bbp_prob_consensus"])
+
+    trigger = "NONE"
+    if prev_osc <= 20 < osc:
+        trigger = "Repair Trigger"
+    elif prev_osc <= 40 < osc:
+        trigger = "Trend Confirm"
+    elif prev_osc <= 60 < osc:
+        trigger = "Bull Thrust"
+    elif prev_osc >= 80 > osc:
+        trigger = "Exhaustion Fade"
+
+    bias = "Rising" if osc > prev_osc else "Falling" if osc < prev_osc else "Flat"
+    internals = []
+    if cci_layer >= 60:
+        internals.append("CCI strong")
+    elif cci_layer <= 40:
+        internals.append("CCI weak")
+    if tsi_layer >= 60:
+        internals.append("TSI confirming")
+    elif tsi_layer <= 40:
+        internals.append("TSI weak")
+    if bbp_layer >= 50:
+        internals.append("%B reclaimed")
+    elif bbp_layer <= 20:
+        internals.append("%B washout")
+
+    return {
+        "state": state,
+        "osc": round(osc, 2),
+        "bias": bias,
+        "trigger": trigger,
+        "slope_3": round(slope_3, 2),
+        "internals": ", ".join(internals) if internals else "Mixed"
+    }
+
+
+def rsp_price_chart(rsp: pd.Series, bars: int, snapshot_entries_df: pd.DataFrame, timeframe: str) -> go.Figure:
+    if rsp is None or rsp.empty:
+        return go.Figure()
+    plot_rsp = rsp.copy()
+    if timeframe == "Weekly":
+        plot_rsp = plot_rsp.resample("W-FRI").last().dropna()
+    plot_rsp = plot_rsp if bars == 0 or len(plot_rsp) <= bars else plot_rsp.iloc[-bars:]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=plot_rsp.index, y=plot_rsp.values, mode="lines",
+        name="RSP", line=dict(width=3)
+    ))
+
+    if not snapshot_entries_df.empty:
+        for _, entry in snapshot_entries_df.iterrows():
+            dt = pd.Timestamp(entry["assigned_date"])
+            if dt < plot_rsp.index.min() or dt > plot_rsp.index.max():
+                continue
+            pos = plot_rsp.index.get_indexer([dt], method="nearest")[0]
+            y = float(plot_rsp.iloc[pos])
+            fig.add_vline(x=dt, line_dash="dot", line_width=1, opacity=0.35)
+            fig.add_annotation(
+                x=dt, y=y, text=f"{dt.date()} · SC {entry['sequence']}",
+                showarrow=True, arrowhead=2, ay=-25,
+                font=dict(size=10), bgcolor="rgba(255,255,255,0.85)"
+            )
+
+    fig.update_layout(
+        title=f"RSP Price ({timeframe})",
+        height=360,
+        xaxis_title="Date",
+        yaxis_title="Price",
+        hovermode="x unified",
+        legend=dict(orientation="h")
+    )
+    return fig
+
+
+def rsp_vs_consensus_chart(rsp: pd.Series, df: pd.DataFrame, bars: int, timeframe: str) -> go.Figure:
+    fig = go.Figure()
+    if rsp is None or rsp.empty or df.empty:
+        return fig
+    rsp_tf = rsp.copy()
+    if timeframe == "Weekly":
+        rsp_tf = rsp_tf.resample("W-FRI").last().dropna()
+
+    joined = pd.concat([rsp_tf.rename("RSP"), df["consensus_osc"]], axis=1).dropna()
+    if bars != 0 and len(joined) > bars:
+        joined = joined.iloc[-bars:]
+
+    fig.add_trace(go.Scatter(
+        x=joined.index, y=joined["RSP"], mode="lines",
+        name="RSP", yaxis="y1", line=dict(width=3)
+    ))
+    fig.add_trace(go.Scatter(
+        x=joined.index, y=joined["consensus_osc"], mode="lines",
+        name="Consensus Osc", yaxis="y2", line=dict(width=2, dash="dash")
+    ))
+    fig.update_layout(
+        title=f"RSP vs Consensus ({timeframe})",
+        height=380,
+        xaxis_title="Date",
+        yaxis=dict(title="RSP Price", side="left"),
+        yaxis2=dict(title="Consensus 0-100", overlaying="y", side="right", range=[0, 100]),
+        hovermode="x unified",
+        legend=dict(orientation="h")
+    )
+    return fig
+
 def ladder_state(score: float) -> Tuple[str, str]:
     s = float(np.clip(score, 0.0, 100.0))
     for low, high, label, color in STATE_LADDER:
@@ -527,6 +672,7 @@ with st.sidebar:
 
     st.header("View")
     chart_window = st.selectbox("Chart window", ["3M", "6M", "1Y", "2Y", "5Y", "10Y", "Max"], index=2)
+    rsp_period = st.selectbox("RSP fetch period", ["2y", "5y", "10y", "max"], index=1)
     persist_log = st.checkbox("Save snapshot log to app_state", value=False)
 
     st.header("Performance")
@@ -569,6 +715,7 @@ if persist_log and not entries_df.empty:
 
 weekly_df = derive_weekly_from_daily(daily_df)
 hourly_df = derive_hourly_like_from_daily(daily_df)
+rsp_series = fetch_rsp_history(rsp_period)
 
 tabs = st.tabs(["Hourly", "Daily", "Weekly", "Snapshot Log", "Notes"])
 bars = bars_from_label(chart_window)
@@ -595,8 +742,18 @@ for tf, df, tab in [
         else:
             st.caption("No daily snapshot uploads stamped yet.")
 
+        signal = build_signal_panel(df)
         render_state_ladder(float(last["consensus_osc"]))
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Bias", signal.get("bias", "N/A"))
+        s2.metric("Trigger", signal.get("trigger", "N/A"))
+        s3.metric("3-bar Slope", signal.get("slope_3", float("nan")))
+        s4.metric("Internals", signal.get("internals", "N/A"))
+
         st.plotly_chart(consensus_chart(df, bars, tf, entries_df), use_container_width=True)
+        st.plotly_chart(rsp_price_chart(rsp_series, bars, entries_df, tf), use_container_width=True)
+        st.plotly_chart(rsp_vs_consensus_chart(rsp_series, df, bars, tf), use_container_width=True)
 
         if not stamped_df.empty and tf in {"Hourly", "Daily", "Weekly"}:
             st.subheader(f"{tf} stamped upload readings")
@@ -651,16 +808,22 @@ with tabs[3]:
 with tabs[4]:
     st.markdown(
         """
-**What changed in v3**
-- Builds the **daily consensus once**
-- Derives **weekly** from daily resampling
-- Derives **hourly-like timing** from the same daily raw consensus
-- Adds `st.cache_data` around the expensive parts
+**What changed in this enhanced version**
+- Adds an **RSP price chart** in each timeframe tab
+- Adds an **RSP vs Consensus** comparison chart
+- Adds a small **signal panel**: Bias, Trigger, 3-bar slope, Internals
+- Keeps the faster **daily-first cached build**
 - Keeps timestamped daily uploads on charts and in tables
 
 **Core model**
 - Per-series normalized oscillator first
 - Then weighted breadth consensus
 - CCI first, then TSI, then %B
+
+**Interpretation**
+- Cross above **20** = repair trigger
+- Cross above **40** = better confirmation
+- Cross above **60** = stronger thrust
+- Fade back below **80** = exhaustion cooling
         """
     )
