@@ -150,11 +150,12 @@ class BellCurveTransform:
         rolling_std = s.rolling(lookback, min_periods=min_periods).std().clip(lower=1e-8)
         z = ((s - rolling_mean) / rolling_std).clip(-z_clip, z_clip)
         cdf = norm.cdf(z) * 100.0
+        cdf_arr = np.asarray(cdf, dtype=float)
         if sigma > 0:
-            smoothed = gaussian_filter1d(cdf.to_numpy(dtype=float), sigma=sigma)
+            smoothed = gaussian_filter1d(cdf_arr, sigma=sigma)
             out = pd.Series(smoothed, index=s.index)
         else:
-            out = pd.Series(cdf, index=s.index)
+            out = pd.Series(cdf_arr, index=s.index)
         out[rolling_mean.isna()] = np.nan
         return out
 
