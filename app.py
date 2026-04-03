@@ -3,7 +3,6 @@ RSP HYBRID OSCILLATOR - STREAMLIT PRODUCTION v2.0
 Features:
 - Upload historical breadth ZIP (StockCharts format)
 - Upload daily snapshot CSV for latest values
-- Defeat Beta API integration
 - Rate limit handling
 """
 
@@ -13,7 +12,7 @@ import numpy as np
 import yfinance as yf
 from scipy.stats import norm
 from scipy.ndimage import gaussian_filter1d
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -85,28 +84,8 @@ def parse_stockcharts_pipe_csv(content: str) -> pd.Series:
         if len(parts) >= 5:
             try:
                 # StockCharts format: Data|Date|Open|High|Low|Close|Volume
-                # Or sometimes just Date|Close
-                date_str = None
-                close_str = None
-                
-                # Check if first line is header
-                if parts[0].lower() == 'data' and len(parts) >= 6:
-                    # Header row - find indices
-                    for i, p in enumerate(parts):
-                        if p.lower() == 'date':
-                            date_idx = i
-                        elif p.lower() == 'close':
-                            close_idx = i
-                    # Use next line for actual data (skip header)
-                    continue
-                else:
-                    # Assume format: Data|Date|Open|High|Low|Close|Volume
-                    date_idx = 1
-                    close_idx = 5
-                
-                if len(parts) > max(date_idx, close_idx):
-                    date_str = parts[date_idx]
-                    close_str = parts[close_idx]
+                date_str = parts[1] if len(parts) > 1 else None
+                close_str = parts[5] if len(parts) > 5 else (parts[4] if len(parts) > 4 else None)
                 
                 if date_str and close_str and date_str.lower() != 'date':
                     date = pd.to_datetime(date_str)
@@ -123,7 +102,7 @@ def parse_stockcharts_pipe_csv(content: str) -> pd.Series:
     return pd.Series(dtype=float)
 
 
-def parse_daily_snapshot_csv(content: str) -> Dict[str, float]:
+def parse_daily_snapshot_csv(content: str) -> dict:
     """Parse daily snapshot CSV (Symbol, Close format)"""
     lines = content.strip().split('\n')
     snapshot = {}
@@ -133,9 +112,6 @@ def parse_daily_snapshot_csv(content: str) -> Dict[str, float]:
         if len(parts) >= 2:
             symbol = parts[0].strip().upper()
             try:
-                # Handle $ symbols in symbol names
-                if symbol.startswith('$'):
-                    symbol = symbol
                 value = float(parts[1])
                 snapshot[symbol] = value
             except ValueError:
@@ -149,7 +125,7 @@ def parse_daily_snapshot_csv(content: str) -> Dict[str, float]:
 # ============================================================================
 
 @st.cache_data(ttl=86400)
-def load_breadth_from_zip(zip_file, snapshot_map=None, snap_date=None) -> Dict[str, pd.Series]:
+def load_breadth_from_zip(zip_file, snapshot_map=None, snap_date=None) -> dict:
     """Load breadth indicators from uploaded zip, apply snapshot for latest values"""
     
     if zip_file is None:
@@ -166,7 +142,8 @@ def load_breadth_from_zip(zip_file, snapshot_map=None, snap_date=None) -> Dict[s
             
             # Match to known indicators
             matched = None
-            for indicator in ['spxa50r', 'spxa200r', 'bpspx', 'bpnya', 'nymo', 'nysi', 'nyad', 'trin', 'cpc', 'cpce']:
+            indicators = ['spxa50r', 'spxa200r', 'bpspx', 'bpnya', 'nymo', 'nysi', 'nyad', 'trin', 'cpc', 'cpce']
+            for indicator in indicators:
                 if indicator in stem:
                     matched = indicator.upper()
                     break
@@ -198,13 +175,13 @@ def load_breadth_from_zip(zip_file, snapshot_map=None, snap_date=None) -> Dict[s
                             series = series[~series.index.duplicated(keep='last')]
                     
                     breadth_data[matched] = series
-                    st.success(f"✓ Loaded {matched} ({len(series)} days)")
+                    st.success(f"Loaded {matched} ({len(series)} days)")
     
     return breadth_data if breadth_data else None
 
 
 @st.cache_data(ttl=3600)
-def load_breadth_from_yahoo() -> Dict[str, pd.Series]:
+def load_breadth_from_yahoo() -> dict:
     """Fallback: load breadth from Yahoo Finance"""
     
     symbols = {
@@ -235,14 +212,14 @@ def load_breadth_from_yahoo() -> Dict[str, pd.Series]:
                         series = df.iloc[:, 0]
                     
                     breadth_data[name] = series.dropna()
-                    st.success(f"✓ Loaded {name} from Yahoo")
+                    st.success(f"Loaded {name} from Yahoo")
                 break
             except Exception as e:
                 if "RateLimit" in str(e) and attempt == 0:
                     time.sleep(2)
                     continue
                 else:
-                    st.warning(f"✗ Could not load {name}: {str(e)[:50]}")
+                    st.warning(f"Could not load {name}: {str(e)[:50]}")
                     break
     
     return breadth_data if breadth_data else None
@@ -275,12 +252,13 @@ def load_price_data(ticker: str, years: int) -> pd.Series:
             return price.dropna()
             
         except Exception as e:
-            if "RateLimit" in str(e) or "Too Many" in str(e):
+            error_msg = str(e)
+            if "RateLimit" in error_msg or "Too Many" in error_msg:
                 wait = (attempt + 1) * 2
                 st.warning(f"Rate limited. Waiting {wait}s...")
                 time.sleep(wait)
             else:
-                st.error(f"Error loading {ticker}: {e}")
+                st.error(f"Error loading {ticker}: {error_msg[:100]}")
                 return None
     
     return None
@@ -298,8 +276,9 @@ def gaussian_cdf_transform(series: pd.Series, lookback: int, sigma: float) -> pd
     s = series.copy()
     s = s.interpolate(limit_direction='both').ffill().bfill()
     
-    rolling_mean = s.rolling(lookback, min_periods=max(20, lookback//3)).mean()
-    rolling_std = s.rolling(lookback, min_periods=max(20, lookback//3)).std()
+    min_periods = max(20, lookback // 3)
+    rolling_mean = s.rolling(lookback, min_periods=min_periods).mean()
+    rolling_std = s.rolling(lookback, min_periods=min_periods).std()
     
     z = (s - rolling_mean) / rolling_std.clip(lower=1e-8)
     z = z.clip(lower=-3.5, upper=3.5)
@@ -650,17 +629,17 @@ def main():
     """Main Streamlit app"""
     
     # Header
-    st.title("📊 RSP Hybrid Oscillator")
+    st.title("RSP Hybrid Oscillator")
     st.markdown("---")
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("Settings")
         
         years = st.slider("Historical Years", 5, 25, 20)
         
         st.markdown("---")
-        st.header("📁 Data Upload")
+        st.header("Data Upload")
         
         # Breadth ZIP upload
         st.subheader("Historical Breadth Data")
@@ -679,10 +658,10 @@ def main():
         )
         
         if snapshot_file:
-            st.success(f"✅ Loaded: {snapshot_file.name}")
+            st.success(f"Loaded: {snapshot_file.name}")
         
         st.markdown("---")
-        st.header("📈 Thresholds")
+        st.header("Thresholds")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -691,7 +670,7 @@ def main():
             bull_exit = st.number_input("Bull Long Exit", value=48.0, step=1.0)
         
         st.markdown("---")
-        st.header("⚠️ Risk")
+        st.header("Risk")
         
         stop_loss = st.slider("Stop Loss %", 2.0, 10.0, 6.0, step=0.5)
         target_vol = st.slider("Target Volatility %", 8.0, 20.0, 12.0, step=1.0)
@@ -715,12 +694,12 @@ def main():
             content = snapshot_file.getvalue().decode('utf-8')
             snapshot_map = parse_daily_snapshot_csv(content)
             snap_date = pd.Timestamp.now().normalize()
-            st.success(f"✅ Parsed {len(snapshot_map)} symbols from snapshot")
+            st.success(f"Parsed {len(snapshot_map)} symbols from snapshot")
         except Exception as e:
             st.error(f"Error parsing snapshot: {e}")
     
     # Load data button
-    if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
+    if st.button("Run Backtest", type="primary", use_container_width=True):
         
         # Load price data
         with st.spinner("Loading RSP price data..."):
@@ -730,7 +709,7 @@ def main():
             st.error("Failed to load price data. Please try again.")
             return
         
-        st.success(f"✅ Loaded {len(price)} days of price data")
+        st.success(f"Loaded {len(price)} days of price data")
         
         # Load breadth data (prioritize uploaded zip)
         breadth = None
@@ -744,9 +723,9 @@ def main():
                 breadth = load_breadth_from_yahoo()
         
         if breadth:
-            st.success(f"✅ Loaded {len(breadth)} breadth indicators")
+            st.success(f"Loaded {len(breadth)} breadth indicators")
         else:
-            st.warning("⚠️ No breadth data available. Using price-only oscillator.")
+            st.warning("No breadth data available. Using price-only oscillator.")
         
         # Calculate oscillator
         with st.spinner("Calculating oscillator..."):
@@ -764,7 +743,7 @@ def main():
         metrics = results['metrics']
         
         st.markdown("---")
-        st.header("📊 Performance Results")
+        st.header("Performance Results")
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -782,7 +761,7 @@ def main():
                      delta_color="normal" if metrics['outperformance'] > 0 else "inverse")
         
         st.markdown("---")
-        st.header("📈 Charts")
+        st.header("Charts")
         
         # Plot results
         fig = create_plots(results)
@@ -793,7 +772,7 @@ def main():
         trades = results.get('trades')
         if trades is not None and not trades.empty:
             st.markdown("---")
-            st.header("📋 Recent Trades")
+            st.header("Recent Trades")
             
             display_trades = trades.tail(20).copy()
             display_trades['pnl_pct'] = display_trades['pnl'] * 100
@@ -808,7 +787,7 @@ def main():
         
         # Current signal
         st.markdown("---")
-        st.header("🔔 Current Signal")
+        st.header("Current Signal")
         
         last_osc = results['oscillator'].iloc[-1]
         last_quality = results['quality'].iloc[-1]
@@ -824,20 +803,20 @@ def main():
         
         # Determine signal
         if last_osc <= config['bull_long_enter'] and last_quality >= config['min_quality']:
-            st.success(f"🔴 **BUY SIGNAL** - Oscillator ({last_osc:.1f}) is oversold and quality ({last_quality:.2f}) is good")
+            st.success(f"BUY SIGNAL - Oscillator ({last_osc:.1f}) is oversold and quality ({last_quality:.2f}) is good")
         elif last_osc >= config['bull_long_exit']:
-            st.info(f"🟢 **CASH SIGNAL** - Oscillator ({last_osc:.1f}) is overbought, take profits")
+            st.info(f"CASH SIGNAL - Oscillator ({last_osc:.1f}) is overbought, take profits")
         else:
-            st.warning(f"⚪ **NEUTRAL** - Wait for oversold condition (oscillator < {config['bull_long_enter']:.0f})")
+            st.warning(f"NEUTRAL - Wait for oversold condition (oscillator < {config['bull_long_enter']:.0f})")
     
     else:
         # Welcome screen before button click
-        st.info("👈 Configure settings in the sidebar, upload breadth ZIP/snapshot, then click **Run Backtest**")
+        st.info("Configure settings in the sidebar, upload breadth ZIP/snapshot, then click Run Backtest")
         
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("""
-            ### 📖 How It Works
+            ### How It Works
             
             **Oscillator (0-100 scale):**
             - **< 20** → Oversold (BUY zone)
@@ -852,12 +831,11 @@ def main():
         
         with col2:
             st.markdown("""
-            ### 📁 Data Upload Options
+            ### Data Upload Options
             
             **1. Historical Breadth ZIP**
             - StockCharts export format
             - Contains historical data for backtesting
-            - Files like _spxa50r.csv, _Bpspx.csv
             
             **2. Daily Snapshot CSV**
             - Format: Symbol, Close
@@ -868,6 +846,16 @@ def main():
         st.markdown("---")
         
         # Show expected file formats
-        with st.expander("📄 Expected File Formats"):
+        with st.expander("Expected File Formats"):
             st.markdown("""
             **Breadth ZIP Contents:**
+            - _spxa50r.csv (S&P 500 % above 50-day MA)
+            - _Bpspx.csv (S&P 500 % bullish)
+            - _Bpnya.csv (NYSE % bullish)
+            - _nymo.csv (McClellan Oscillator)
+            - _nysi.csv (Summation Index)
+            - _nyad.csv (Advance-Decline)
+            - _trin.csv (Arms Index - inverted)
+            - _cpc.csv (Put/Call Ratio - inverted)
+            
+            **Snapshot CSV Format:**
