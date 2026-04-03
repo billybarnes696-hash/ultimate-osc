@@ -448,33 +448,21 @@ def load_snapshot_log() -> pd.DataFrame:
 
 def render_state_ladder(score: float):
     active_label, _ = ladder_state(score)
-    html_parts = []
-    for low, high, label, color in STATE_LADDER:
+    st.markdown(f"**State ladder — current zone: {active_label} ({score:.2f})**")
+    cols = st.columns(len(STATE_LADDER))
+    for col, (low, high, label, color) in zip(cols, STATE_LADDER):
         active = label == active_label
         border = "3px solid #111827" if active else "1px solid rgba(15,23,42,0.15)"
-        shadow = "box-shadow: inset 0 0 0 9999px rgba(255,255,255,0.08);" if active else ""
-        html_parts.append(
+        col.markdown(
             f"""
-            <div style="flex:1; min-width:120px; background:{color}; color:white; border:{border};
-                        border-radius:12px; padding:10px 12px; {shadow}">
+            <div style="background:{color}; color:white; border:{border};
+                        border-radius:12px; padding:10px 12px; text-align:center; min-height:78px;">
                 <div style="font-size:12px; opacity:0.9;">{low:.0f}–{high:.0f}</div>
                 <div style="font-size:16px; font-weight:700; line-height:1.2;">{label}</div>
             </div>
-            """
+            """,
+            unsafe_allow_html=True,
         )
-    st.markdown(
-        f"""
-        <div style="margin: 0.35rem 0 0.75rem 0;">
-            <div style="font-size:0.95rem; font-weight:700; margin-bottom:0.35rem;">
-                State ladder — current zone: {active_label} ({score:.2f})
-            </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                {''.join(html_parts)}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def consensus_chart(df: pd.DataFrame, bars: int, timeframe: str, snapshot_entries_df: pd.DataFrame) -> go.Figure:
