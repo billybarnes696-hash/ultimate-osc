@@ -1,17 +1,13 @@
-import os
-import io
 import math
-import json
+import os
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 from scipy.stats import gaussian_kde, norm
@@ -22,229 +18,47 @@ from scipy.stats import gaussian_kde, norm
 st.set_page_config(page_title="Diamond Scanner", layout="wide")
 st.title("💎 Diamond Scanner")
 st.caption(
-    "StockCharts-style overheated rollover scanner with persistent Yahoo cache, "
-    "Gaussian/CDF bells, and an ultimate fade oscillator."
+    "Warehouse-first stock scanner with persistent caching, adjustable diamond scoring, and empirical bell curves."
 )
 
-APP_TZ = timezone.utc
-TODAY_UTC = datetime.now(APP_TZ).date()
 CACHE_ROOT = Path("cache")
-PRICE_CACHE_DIR = CACHE_ROOT / "prices_daily"
-SNAPSHOT_CACHE_DIR = CACHE_ROOT / "snapshots"
-META_CACHE_DIR = CACHE_ROOT / "meta"
-for p in [PRICE_CACHE_DIR, SNAPSHOT_CACHE_DIR, META_CACHE_DIR]:
+DAILY_CACHE = CACHE_ROOT / "daily"
+META_CACHE = CACHE_ROOT / "meta"
+SNAPSHOT_CACHE = CACHE_ROOT / "snapshots"
+for p in [CACHE_ROOT, DAILY_CACHE, META_CACHE, SNAPSHOT_CACHE]:
     p.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_ETFS = [
-    "SPY", "RSP", "QQQ", "IWM", "DIA", "SMH", "XLF", "XLK", "XLE", "XLI",
-    "XLP", "XLY", "XLV", "XLC", "XLB", "XLU", "XBI", "ARKK", "HYG", "TLT",
-    "IEF", "KRE", "XHB", "SOXX", "IGV", "IYT", "ITB", "XRT", "GDX", "SLV",
+DEFAULT_UNIVERSE = [
+    # Broad ETFs and liquid stocks
+    "SPY","QQQ","IWM","DIA","RSP","SMH","XLF","XLK","XLE","XLI","XLP","XLV","XLY","XLC","XLB","XLRE","XBI","ARKK","SOXX","KRE",
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AMD","NFLX","AVGO","COST","JPM","GS","MS","BAC","WFC","C","SCHW","BLK",
+    "UNH","LLY","ABBV","MRK","PFE","ISRG","VRTX","ABT","TMO","DHR","HD","LOW","MCD","SBUX","BKNG","UBER","ORLY","TJX",
+    "CAT","DE","GE","ETN","PH","HON","MMM","UNP","CSX","NSC","LMT","RTX","BA","NOC","INTC","MU","QCOM","AMAT","LRCX","KLAC",
+    "CRM","ORCL","ADBE","NOW","PANW","CRWD","PLTR","SNOW","SHOP","MDB","ANET","V","MA","PYPL","COIN","HOOD","AXP","CB","PGR",
+    "LEVI","EXTR","FTV","ITT","FIS","FI","ICE","CME","KKR","BX","APO","Ares","HWM","TT","URI"
 ]
-
-DEFAULT_STOCKS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD", "NFLX", "AVGO",
-    "JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "KKR", "SCHW", "COF",
-    "GS", "BX", "APO", "CME", "ICE", "V", "MA", "PYPL", "SQ", "HOOD",
-    "LLY", "UNH", "PFE", "MRK", "ABBV", "ISRG", "ABT", "TMO", "BSX", "SYK",
-    "HD", "LOW", "AMZN", "TJX", "BKNG", "RCL", "CCL", "NKE", "LEVI", "DECK",
-    "CAT", "DE", "PH", "ETN", "GE", "GEV", "FTV", "ITT", "EMR", "ROK",
-    "INTC", "MU", "QCOM", "ANET", "PANW", "CRWD", "SNOW", "PLTR", "ORCL", "ADBE",
-    "EXTR", "SHOP", "MELI", "UBER", "DASH", "ABNB", "CRM", "NOW", "MDB", "DDOG",
-]
-
-BUILTIN_UNIVERSE = sorted(set(DEFAULT_ETFS + DEFAULT_STOCKS))
-
-SECTOR_MAP = {
-    "XLF": "Financials ETF", "KRE": "Regional Banks ETF", "XLK": "Technology ETF", "SMH": "Semiconductors ETF",
-    "XLE": "Energy ETF", "XLI": "Industrials ETF", "XLY": "Consumer Discretionary ETF", "XLP": "Consumer Staples ETF",
-    "XLV": "Health Care ETF", "XLC": "Communication Services ETF", "XLB": "Materials ETF", "XLU": "Utilities ETF",
-}
+DEFAULT_UNIVERSE = sorted({s.upper() for s in DEFAULT_UNIVERSE if s.isalpha() or s.replace('^','').isalnum()})
 
 # =============================================================================
 # HELPERS
 # =============================================================================
-def normalize_ticker(x: str) -> str:
-    return str(x).strip().upper().replace(" ", "")
+def sanitize_ticker(t: str) -> str:
+    return str(t).strip().upper().replace("/", "-")
 
 
-def parse_tickers_from_text(raw: str) -> List[str]:
-    raw = raw.replace("\n", ",").replace(";", ",").replace("\t", ",")
-    return [normalize_ticker(x) for x in raw.split(",") if normalize_ticker(x)]
+def parquet_path(symbol: str) -> Path:
+    return DAILY_CACHE / f"{sanitize_ticker(symbol)}.parquet"
 
 
-def is_market_day(ts: pd.Timestamp) -> bool:
-    return ts.dayofweek < 5
+def meta_path(symbol: str) -> Path:
+    return META_CACHE / f"{sanitize_ticker(symbol)}.json"
 
 
-def today_str() -> str:
-    return TODAY_UTC.strftime("%Y-%m-%d")
-
-
-def parquet_path_for_symbol(symbol: str) -> Path:
-    return PRICE_CACHE_DIR / f"{symbol}.parquet"
-
-
-def meta_path_for_symbol(symbol: str) -> Path:
-    return META_CACHE_DIR / f"{symbol}.json"
-
-
-def load_symbol_cache(symbol: str) -> pd.DataFrame:
-    path = parquet_path_for_symbol(symbol)
-    if not path.exists():
-        return pd.DataFrame()
+def safe_float(x, default=np.nan):
     try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-        return df
+        return float(x)
     except Exception:
-        return pd.DataFrame()
-
-
-def save_symbol_cache(symbol: str, df: pd.DataFrame, source_note: str = "yahoo") -> None:
-    if df.empty:
-        return
-    df = df.sort_index()
-    df.to_parquet(parquet_path_for_symbol(symbol))
-    meta = {
-        "symbol": symbol,
-        "last_write_utc": datetime.now(APP_TZ).isoformat(),
-        "last_bar": str(df.index.max().date()),
-        "rows": int(len(df)),
-        "source": source_note,
-    }
-    meta_path_for_symbol(symbol).write_text(json.dumps(meta, indent=2))
-
-
-def read_symbol_meta(symbol: str) -> Dict:
-    path = meta_path_for_symbol(symbol)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return {}
-
-
-def cache_status_for_symbol(symbol: str) -> str:
-    meta = read_symbol_meta(symbol)
-    if not meta:
-        return "missing"
-    try:
-        last_bar = pd.Timestamp(meta.get("last_bar"))
-    except Exception:
-        return "stale"
-    if last_bar.date() >= TODAY_UTC - timedelta(days=1):
-        return "fresh"
-    return "stale"
-
-
-def chunked(seq: List[str], size: int) -> List[List[str]]:
-    return [seq[i:i + size] for i in range(0, len(seq), size)]
-
-
-def standardize_download(data: pd.DataFrame, symbols: List[str]) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if data is None or len(data) == 0:
-        return out
-
-    if isinstance(data.columns, pd.MultiIndex):
-        lvl0 = list(data.columns.get_level_values(0).unique())
-        lvl1 = list(data.columns.get_level_values(1).unique())
-
-        if set(symbols).intersection(lvl0):
-            for sym in symbols:
-                if sym in lvl0:
-                    sub = data[sym].copy()
-                    sub.columns = [str(c).title() for c in sub.columns]
-                    out[sym] = sub
-        elif set(symbols).intersection(lvl1):
-            for sym in symbols:
-                if sym in lvl1:
-                    sub = data.xs(sym, axis=1, level=1).copy()
-                    sub.columns = [str(c).title() for c in sub.columns]
-                    out[sym] = sub
-    else:
-        # Single symbol
-        sym = symbols[0]
-        sub = data.copy()
-        sub.columns = [str(c).title() for c in sub.columns]
-        out[sym] = sub
-
-    for sym, sub in list(out.items()):
-        if sub.empty:
-            continue
-        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in sub.columns]
-        sub = sub[keep].copy()
-        sub.index = pd.to_datetime(sub.index).tz_localize(None)
-        sub = sub[~sub.index.duplicated(keep="last")].sort_index()
-        out[sym] = sub
-    return out
-
-
-def download_batch(symbols: List[str], period: str = "2y", interval: str = "1d", start: Optional[str] = None) -> Dict[str, pd.DataFrame]:
-    if not symbols:
-        return {}
-    kwargs = dict(
-        tickers=symbols,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=False,
-        prepost=False,
-    )
-    if start:
-        kwargs["start"] = start
-    else:
-        kwargs["period"] = period
-
-    data = yf.download(**kwargs)
-    return standardize_download(data, symbols)
-
-
-def refresh_symbol_cache(symbols: List[str], full_refresh: bool, batch_size: int = 25, pause_seconds: float = 1.0) -> Tuple[List[str], List[str]]:
-    refreshed, failed = [], []
-    targets = [normalize_ticker(s) for s in symbols if normalize_ticker(s)]
-    for batch in chunked(targets, batch_size):
-        batch_start = None
-        if not full_refresh:
-            # use recent incremental window that still covers indicator lookbacks safely
-            batch_start = (TODAY_UTC - timedelta(days=120)).strftime("%Y-%m-%d")
-        try:
-            pulled = download_batch(batch, period="2y", interval="1d", start=batch_start)
-        except Exception:
-            pulled = {}
-
-        for sym in batch:
-            new_df = pulled.get(sym, pd.DataFrame())
-            old_df = load_symbol_cache(sym)
-            if new_df.empty and old_df.empty:
-                failed.append(sym)
-                continue
-            if old_df.empty:
-                merged = new_df.copy()
-            elif new_df.empty:
-                merged = old_df.copy()
-            else:
-                merged = pd.concat([old_df, new_df], axis=0)
-                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            if merged.empty:
-                failed.append(sym)
-                continue
-            save_symbol_cache(sym, merged, source_note="yahoo_incremental" if not full_refresh else "yahoo_full")
-            refreshed.append(sym)
-        time.sleep(pause_seconds)
-    return refreshed, failed
-
-
-def load_history_for_universe(symbols: List[str], min_bars: int = 120) -> Dict[str, pd.DataFrame]:
-    out = {}
-    for sym in symbols:
-        df = load_symbol_cache(sym)
-        if len(df) >= min_bars and "Close" in df.columns:
-            out[sym] = df.copy()
-    return out
+        return default
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -252,21 +66,23 @@ def ema(series: pd.Series, span: int) -> pd.Series:
 
 
 def tsi(close: pd.Series, long: int, short: int, signal: int) -> Tuple[pd.Series, pd.Series]:
-    mtm = close.diff()
-    abs_mtm = mtm.abs()
-    tsi_raw = 100 * (ema(ema(mtm, long), short) / ema(ema(abs_mtm, long), short).replace(0, np.nan))
-    sig = ema(tsi_raw, signal)
-    return tsi_raw, sig
+    m = close.diff()
+    abs_m = m.abs()
+    double_smoothed_m = ema(ema(m, long), short)
+    double_smoothed_abs = ema(ema(abs_m, long), short)
+    tsi_line = 100 * double_smoothed_m / double_smoothed_abs.replace(0, np.nan)
+    signal_line = ema(tsi_line, signal)
+    return tsi_line, signal_line
 
 
-def cci(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    tp = (high + low + close) / 3.0
+def cci(df: pd.DataFrame, length: int = 15) -> pd.Series:
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     sma = tp.rolling(length).mean()
     mad = tp.rolling(length).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
     return (tp - sma) / (0.015 * mad.replace(0, np.nan))
 
 
-def bb_percent_b(close: pd.Series, length: int = 20, num_std: float = 2.0) -> pd.Series:
+def bb_pct(close: pd.Series, length: int = 20, num_std: float = 2.0) -> pd.Series:
     ma = close.rolling(length).mean()
     sd = close.rolling(length).std(ddof=0)
     upper = ma + num_std * sd
@@ -274,180 +90,248 @@ def bb_percent_b(close: pd.Series, length: int = 20, num_std: float = 2.0) -> pd
     return (close - lower) / (upper - lower).replace(0, np.nan)
 
 
-def robust_zscore(series: pd.Series, lookback: int = 126) -> pd.Series:
-    med = series.rolling(lookback).median()
-    mad = series.rolling(lookback).apply(lambda x: np.median(np.abs(x - np.median(x))), raw=True)
-    robust_std = 1.4826 * mad.replace(0, np.nan)
-    return (series - med) / robust_std
-
-
-def rolling_percentile(series: pd.Series, lookback: int = 126) -> pd.Series:
-    def pct_rank(x: np.ndarray) -> float:
-        valid = x[~np.isnan(x)]
-        if len(valid) < max(20, int(lookback * 0.5)):
+def percentile_rank(series: pd.Series, lookback: int = 252) -> pd.Series:
+    def _pct(x):
+        s = pd.Series(x).dropna()
+        if len(s) < max(20, lookback // 4):
             return np.nan
-        return 100.0 * (valid <= valid[-1]).sum() / len(valid)
-    return series.rolling(lookback, min_periods=max(20, int(lookback * 0.5))).apply(pct_rank, raw=True)
+        return 100.0 * (s.rank(pct=True).iloc[-1])
+    return series.rolling(lookback, min_periods=max(20, lookback // 4)).apply(_pct, raw=False)
 
 
-def gaussian_cdf_score(series: pd.Series, lookback: int = 126, clip_z: float = 3.5) -> pd.Series:
-    z = robust_zscore(series, lookback=lookback).clip(-clip_z, clip_z)
+def robust_cdf(series: pd.Series, lookback: int = 252) -> pd.Series:
+    med = series.rolling(lookback, min_periods=max(20, lookback // 4)).median()
+    mad = series.rolling(lookback, min_periods=max(20, lookback // 4)).apply(
+        lambda x: np.median(np.abs(pd.Series(x).dropna() - np.median(pd.Series(x).dropna()))) if len(pd.Series(x).dropna()) else np.nan,
+        raw=False,
+    )
+    robust_std = 1.4826 * mad.replace(0, np.nan)
+    z = ((series - med) / robust_std).clip(-3.5, 3.5)
     return pd.Series(norm.cdf(z) * 100.0, index=series.index)
 
 
-def normalized_composite(values: Dict[str, pd.Series], weights: Dict[str, float]) -> pd.Series:
-    cols = [k for k in weights.keys() if k in values]
-    if not cols:
-        return pd.Series(dtype=float)
-    df = pd.concat([values[c] for c in cols], axis=1)
-    df.columns = cols
-    w = pd.Series({c: weights[c] for c in cols}, dtype=float)
-    numerator = df.mul(w, axis=1).sum(axis=1, skipna=True)
-    denom = df.notna().mul(w, axis=1).sum(axis=1).replace(0, np.nan)
-    return numerator / denom
+def empirical_score(series: pd.Series, lookback: int = 252, invert: bool = False, smooth: int = 3) -> pd.Series:
+    p = percentile_rank(series, lookback)
+    c = robust_cdf(series, lookback)
+    slope = series.diff().ewm(span=5, adjust=False).mean()
+    persist = 50 + np.tanh(slope.fillna(0) * 5) * 12
+    score = (0.50 * p) + (0.35 * c) + (0.15 * persist)
+    if invert:
+        score = 100 - score
+    if smooth and smooth > 1:
+        score = score.ewm(span=smooth, adjust=False).mean()
+    return score.clip(0, 100)
 
 
-def build_indicator_frame(df: pd.DataFrame) -> pd.DataFrame:
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    high = pd.to_numeric(df.get("High", close), errors="coerce")
-    low = pd.to_numeric(df.get("Low", close), errors="coerce")
-    volume = pd.to_numeric(df.get("Volume"), errors="coerce")
+def batch_download(symbols: List[str], period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    data = yf.download(
+        tickers=symbols,
+        period=period,
+        interval=interval,
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+    return data
 
-    out = pd.DataFrame(index=df.index)
-    out["Close"] = close
-    out["Volume"] = volume
+
+def normalize_download(data: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    symbol = sanitize_ticker(symbol)
+    if data.empty:
+        return pd.DataFrame()
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            if symbol not in data.columns.get_level_values(0):
+                return pd.DataFrame()
+            out = data[symbol].copy()
+        else:
+            out = data.copy()
+        needed = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in out.columns]
+        out = out[needed].copy()
+        out.index = pd.to_datetime(out.index).tz_localize(None)
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        for col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        if "Adj Close" not in out.columns and "Close" in out.columns:
+            out["Adj Close"] = out["Close"]
+        return out.dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_cached_symbol(symbol: str) -> pd.DataFrame:
+    path = parquet_path(symbol)
+    if path.exists():
+        try:
+            df = pd.read_parquet(path)
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            return df.sort_index()
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def save_cached_symbol(symbol: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    path = parquet_path(symbol)
+    df = df.copy().sort_index()
+    df.to_parquet(path)
+
+
+def symbol_is_stale(df: pd.DataFrame, refresh_days: int = 1) -> bool:
+    if df.empty:
+        return True
+    last = pd.to_datetime(df.index.max())
+    now = pd.Timestamp.now().tz_localize(None)
+    if now.normalize() <= last.normalize():
+        return False
+    return (now.normalize() - last.normalize()).days >= refresh_days
+
+
+def refresh_cache(symbols: List[str], batch_size: int, sleep_s: float, period: str = "2y") -> Tuple[int, int]:
+    updated = 0
+    failed = 0
+    symbols = [sanitize_ticker(s) for s in symbols]
+    stale = [s for s in symbols if symbol_is_stale(load_cached_symbol(s), refresh_days=1)]
+    for i in range(0, len(stale), batch_size):
+        batch = stale[i:i + batch_size]
+        try:
+            raw = batch_download(batch, period=period, interval="1d")
+            for sym in batch:
+                df = normalize_download(raw, sym)
+                if df.empty:
+                    failed += 1
+                    continue
+                old = load_cached_symbol(sym)
+                if not old.empty:
+                    df = pd.concat([old, df]).sort_index()
+                    df = df[~df.index.duplicated(keep="last")]
+                save_cached_symbol(sym, df)
+                updated += 1
+        except Exception:
+            failed += len(batch)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    return updated, failed
+
+
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or len(df) < 60:
+        return pd.DataFrame()
+    out = df.copy()
+    close = out["Adj Close"].fillna(out["Close"])
     out["SMA10"] = close.rolling(10).mean()
     out["SMA20"] = close.rolling(20).mean()
     out["SMA50"] = close.rolling(50).mean()
-    out["AVG_VOL20"] = volume.rolling(20).mean()
-    out["EXT10"] = close / out["SMA10"] - 1.0
-    out["BBPCT"] = bb_percent_b(close, 20, 2.0)
-    out["CCI15"] = cci(high, low, close, 15)
+    out["AVG_VOL20"] = out["Volume"].rolling(20).mean()
+    out["EXT10"] = (close / out["SMA10"]) - 1
+    out["TSI_323"], out["TSI_323_SIG"] = tsi(close, 3, 2, 3)
+    out["TSI_747"], out["TSI_747_SIG"] = tsi(close, 7, 4, 7)
+    out["CCI15"] = cci(out, 15)
     out["CCI15_DELTA"] = out["CCI15"].diff()
+    out["BBPCT"] = bb_pct(close, 20, 2.0)
+    out["RET5"] = close.pct_change(5)
+    out["RET3"] = close.pct_change(3)
+    out["TSI_323_SCORE"] = empirical_score(out["TSI_323"], 252)
+    out["TSI_747_SCORE"] = empirical_score(out["TSI_747"], 252)
+    out["CCI15_SCORE"] = empirical_score(out["CCI15"], 252)
+    out["BBPCT_SCORE"] = empirical_score(out["BBPCT"], 252)
+    out["EXT10_SCORE"] = empirical_score(out["EXT10"], 252)
 
-    tsi_323, tsi_323_sig = tsi(close, 3, 2, 3)
-    tsi_747, tsi_747_sig = tsi(close, 7, 4, 7)
-    out["TSI_323"] = tsi_323
-    out["TSI_323_SIG"] = tsi_323_sig
-    out["TSI_747"] = tsi_747
-    out["TSI_747_SIG"] = tsi_747_sig
-
-    # institutional-style bell ingredients
-    out["TSI_323_PCT"] = rolling_percentile(out["TSI_323"], 126)
-    out["TSI_747_PCT"] = rolling_percentile(out["TSI_747"], 126)
-    out["CCI15_PCT"] = rolling_percentile(out["CCI15"], 126)
-    out["BBPCT_PCT"] = rolling_percentile(out["BBPCT"], 126)
-    out["EXT10_PCT"] = rolling_percentile(out["EXT10"], 126)
-
-    bell_inputs = {
-        "TSI_323_BELL": gaussian_cdf_score(out["TSI_323"], 126),
-        "TSI_747_BELL": gaussian_cdf_score(out["TSI_747"], 126),
-        "CCI15_BELL": gaussian_cdf_score(out["CCI15"], 126),
-        "BBPCT_BELL": gaussian_cdf_score(out["BBPCT"], 126),
-        "EXT10_BELL": gaussian_cdf_score(out["EXT10"], 126),
-    }
-    for k, v in bell_inputs.items():
-        out[k] = v
-
-    comp_weights = {
-        "TSI_323_BELL": 0.28,
-        "TSI_747_BELL": 0.20,
-        "CCI15_BELL": 0.22,
-        "BBPCT_BELL": 0.18,
-        "EXT10_BELL": 0.12,
-    }
-    out["ULTIMATE_BELL"] = normalized_composite({k: out[k] for k in comp_weights}, comp_weights)
-    out["ULTIMATE_SLOPE3"] = out["ULTIMATE_BELL"].diff(3)
-    out["FREEFALL_SCORE"] = (
-        0.35 * out["ULTIMATE_BELL"] +
-        0.20 * out["TSI_323_PCT"] +
-        0.15 * out["CCI15_PCT"] +
-        0.15 * out["BBPCT_PCT"] +
-        0.15 * out["EXT10_PCT"]
+    # Diamond sub-scores: strength + early rollover + stretch
+    out["HEAT_SCORE"] = (
+        0.33 * out["TSI_323_SCORE"] +
+        0.23 * out["TSI_747_SCORE"] +
+        0.22 * out["CCI15_SCORE"] +
+        0.22 * out["BBPCT_SCORE"]
     )
+
+    cci_roll_component = (50 + np.tanh((-out["CCI15_DELTA"].fillna(0)) / 8.0) * 50).clip(0, 100)
+    ext_component = out["EXT10_SCORE"]
+    signal_gap = (out["TSI_323"] - out["TSI_323_SIG"]).fillna(0)
+    gap_component = (50 + np.tanh(signal_gap / 6.0) * 20).clip(0, 100)
+    overheat_penalty = np.where(out["TSI_323"] > 99.5, 8, 0) + np.where(out["BBPCT"] > 1.10, 8, 0)
+
+    out["DIAMOND_SCORE"] = (
+        0.45 * out["HEAT_SCORE"] +
+        0.25 * cci_roll_component +
+        0.20 * ext_component +
+        0.10 * gap_component -
+        overheat_penalty
+    ).clip(0, 100)
+
+    out["ULTIMATE_SCORE"] = (
+        0.30 * out["TSI_323_SCORE"] +
+        0.25 * out["TSI_747_SCORE"] +
+        0.20 * out["CCI15_SCORE"] +
+        0.15 * out["BBPCT_SCORE"] +
+        0.10 * out["EXT10_SCORE"]
+    ).clip(0, 100)
     return out
 
 
-def sector_for_symbol(symbol: str) -> str:
-    return SECTOR_MAP.get(symbol, "Unknown")
+def latest_row_with_symbol(symbol: str, df: pd.DataFrame) -> pd.Series:
+    row = df.dropna(how="all").iloc[-1].copy()
+    row["Ticker"] = symbol
+    row["Date"] = df.dropna(how="all").index[-1]
+    return row
 
 
-def scan_latest(history_map: Dict[str, pd.DataFrame], require_proxy_optionable: bool = False) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+def run_scan(universe: List[str], min_price: float, min_avg_vol: float, tsi323_min: float, tsi747_min: float,
+             cci_min: float, bbpct_min: float, ext10_min: float, require_above_sma20: bool,
+             require_above_sma50: bool, require_cci_roll: bool) -> pd.DataFrame:
     rows = []
-    indicator_map: Dict[str, pd.DataFrame] = {}
-
-    for sym, hist in history_map.items():
-        try:
-            ind = build_indicator_frame(hist)
-        except Exception:
+    for symbol in universe:
+        raw = load_cached_symbol(symbol)
+        feat = compute_features(raw)
+        if feat.empty:
             continue
-        indicator_map[sym] = ind
-        if len(ind.dropna()) < 60:
-            continue
-        last = ind.iloc[-1]
-        prev = ind.iloc[-2] if len(ind) > 1 else last
+        last = latest_row_with_symbol(symbol, feat)
+        close = safe_float(last.get("Adj Close", last.get("Close", np.nan)))
+        avg_vol = safe_float(last.get("AVG_VOL20", np.nan))
+        conds = [
+            close > min_price,
+            avg_vol > min_avg_vol,
+            safe_float(last.get("TSI_323", np.nan)) > tsi323_min,
+            safe_float(last.get("TSI_747", np.nan)) > tsi747_min,
+            safe_float(last.get("CCI15", np.nan)) > cci_min,
+            safe_float(last.get("BBPCT", np.nan)) > bbpct_min,
+            safe_float(last.get("EXT10", np.nan)) > ext10_min,
+        ]
+        if require_above_sma20:
+            conds.append(close > safe_float(last.get("SMA20", np.nan)))
+        if require_above_sma50:
+            conds.append(close > safe_float(last.get("SMA50", np.nan)))
+        if require_cci_roll:
+            conds.append(safe_float(last.get("CCI15_DELTA", np.nan)) < 0)
+        if all(conds):
+            rows.append(last)
 
-        optionable_proxy = last["AVG_VOL20"] >= 1_000_000 and last["Close"] > 5
-        if require_proxy_optionable and not optionable_proxy:
-            continue
+    if not rows:
+        return pd.DataFrame()
 
-        pass_scan = (
-            (last["Close"] > 5) and
-            (last["AVG_VOL20"] > 1_000_000) and
-            (last["Close"] > last["SMA20"]) and
-            (last["Close"] > last["SMA50"]) and
-            (last["TSI_323"] > 95) and
-            (last["TSI_747"] > 70) and
-            (last["CCI15"] > 90) and
-            (last["CCI15"] < prev["CCI15"]) and
-            (last["BBPCT"] > 0.95) and
-            (last["EXT10"] > 0.03)
-        )
-
-        score = (
-            22 * min(1.2, max(0, last["TSI_323"] / 100.0)) +
-            13 * min(1.2, max(0, last["TSI_747"] / 80.0)) +
-            15 * min(1.2, max(0, last["CCI15"] / 120.0)) +
-            15 * min(1.2, max(0, last["BBPCT"] / 1.05)) +
-            12 * min(1.2, max(0, last["EXT10"] / 0.05)) +
-            10 * min(1.2, max(0, last["ULTIMATE_BELL"] / 100.0)) +
-            13 * (1 if last["ULTIMATE_SLOPE3"] < 0 else 0)
-        )
-
-        rows.append({
-            "Ticker": sym,
-            "Date": ind.index[-1].date(),
-            "Sector": sector_for_symbol(sym),
-            "Close": last["Close"],
-            "AvgVol20": last["AVG_VOL20"],
-            "TSI(3,2,3)": last["TSI_323"],
-            "TSI(7,4,7)": last["TSI_747"],
-            "CCI(15)": last["CCI15"],
-            "CCIΔ": last["CCI15"] - prev["CCI15"],
-            "%B(20,2)": last["BBPCT"],
-            "Ext10": last["EXT10"],
-            "UltimateBell": last["ULTIMATE_BELL"],
-            "FreeFallScore": last["FREEFALL_SCORE"],
-            "DiamondScore": score,
-            "ScanPass": pass_scan,
-            "ProxyOptionable": bool(optionable_proxy),
-            "Freshness": cache_status_for_symbol(sym),
-        })
-
-    res = pd.DataFrame(rows)
-    if res.empty:
-        return res, indicator_map
-    res = res.sort_values(["ScanPass", "DiamondScore", "%B(20,2)"], ascending=[False, False, False]).reset_index(drop=True)
-    return res, indicator_map
+    df = pd.DataFrame(rows)
+    cols = [
+        "Ticker","Date","Adj Close","AVG_VOL20","SMA20","SMA50","TSI_323","TSI_747","CCI15","CCI15_DELTA",
+        "BBPCT","EXT10","HEAT_SCORE","DIAMOND_SCORE","ULTIMATE_SCORE","TSI_323_SCORE","TSI_747_SCORE","CCI15_SCORE","BBPCT_SCORE","EXT10_SCORE"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[cols].sort_values(["DIAMOND_SCORE","BBPCT"], ascending=[False, False]).reset_index(drop=True)
 
 
-def bell_curve_figure(series: pd.Series, current_val: float, title: str, x_label: str = "Score") -> go.Figure:
-    s = pd.to_numeric(series, errors="coerce").dropna().tail(252)
+def empirical_bell_figure(series: pd.Series, current_value: float, prev_value: float, title: str, x_title: str = "Score (0-100)") -> go.Figure:
     fig = go.Figure()
-    x = np.linspace(0, 100, 250)
-    if len(s) >= 25:
+    hist = pd.Series(series).dropna().tail(252)
+    x = np.linspace(0, 100, 300)
+    if len(hist) >= 20:
         try:
-            kde = gaussian_kde(s.values)
+            kde = gaussian_kde(hist.values)
             y = kde(x)
             y = y / y.max() * 100
         except Exception:
@@ -459,217 +343,193 @@ def bell_curve_figure(series: pd.Series, current_val: float, title: str, x_label
         y = norm.pdf(z)
         y = y / y.max() * 100
 
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy", name="Density"))
-    for lo, hi, color in [(0, 20, "rgba(0,200,83,0.10)"), (20, 40, "rgba(144,238,144,0.10)"), (40, 60, "rgba(255,245,157,0.10)"), (60, 80, "rgba(255,224,130,0.10)"), (80, 100, "rgba(255,23,68,0.10)")]:
-        fig.add_vrect(x0=lo, x1=hi, fillcolor=color, line_width=0)
-    if pd.notna(current_val):
-        yv = np.interp(current_val, x, y)
-        fig.add_trace(go.Scatter(
-            x=[current_val], y=[yv], mode="markers+text", text=[f"{current_val:.1f}"], textposition="top center",
-            marker=dict(size=14, line=dict(width=2, color="black"))
-        ))
-    fig.update_layout(title=title, height=240, margin=dict(l=10, r=10, t=45, b=10), xaxis_title=x_label, yaxis_visible=False)
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy", line=dict(width=2)))
+    bands = [
+        (0,15,"#00c853"),(15,30,"#90ee90"),(30,45,"#fff59d"),(45,55,"#ffffff"),(55,70,"#ffe082"),(70,85,"#ef9a9a"),(85,100,"#ff1744")
+    ]
+    for lo, hi, color in bands:
+        fig.add_vrect(x0=lo, x1=hi, fillcolor=color, opacity=0.12, line_width=0)
+    fig.add_vline(x=50, line_dash="dash", line_color="gray")
+
+    if pd.notna(prev_value):
+        py = norm.pdf((prev_value - 50) / 16.5) / norm.pdf(0) * 100
+        fig.add_trace(go.Scatter(x=[prev_value], y=[py], mode="markers", marker=dict(size=9, color="rgba(255,255,255,0.45)"), showlegend=False))
+    if pd.notna(current_value):
+        cy = norm.pdf((current_value - 50) / 16.5) / norm.pdf(0) * 100
+        fig.add_trace(go.Scatter(x=[current_value], y=[cy], mode="markers+text", text=[f"{current_value:.1f}"], textposition="top center", marker=dict(size=14, line=dict(color="black", width=2)), showlegend=False))
+
+    fig.update_layout(title=title, height=230, margin=dict(l=20,r=20,t=45,b=20), xaxis_title=x_title, yaxis_visible=False)
+    fig.update_xaxes(range=[0,100])
     return fig
 
 
-def line_stack_figure(ind: pd.DataFrame, symbol: str) -> go.Figure:
-    show = ind.tail(180).copy()
-    fig = make_subplots(rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        subplot_titles=[f"{symbol} Price", "Ultimate Bell", "TSI / CCI", "%B / Ext10", "Diamond Score"])
-    fig.add_trace(go.Scatter(x=show.index, y=show["Close"], name="Close"), row=1, col=1)
-    if "SMA10" in show:
-        fig.add_trace(go.Scatter(x=show.index, y=show["SMA10"], name="SMA10"), row=1, col=1)
-    if "SMA20" in show:
-        fig.add_trace(go.Scatter(x=show.index, y=show["SMA20"], name="SMA20"), row=1, col=1)
-
-    fig.add_trace(go.Scatter(x=show.index, y=show["ULTIMATE_BELL"], name="UltimateBell"), row=2, col=1)
-    fig.add_hline(y=80, row=2, col=1, line_dash="dot")
-    fig.add_hline(y=50, row=2, col=1, line_dash="dash")
-
-    fig.add_trace(go.Scatter(x=show.index, y=show["TSI_323"], name="TSI323"), row=3, col=1)
-    fig.add_trace(go.Scatter(x=show.index, y=show["TSI_747"], name="TSI747"), row=3, col=1)
-    fig.add_trace(go.Scatter(x=show.index, y=show["CCI15"], name="CCI15"), row=3, col=1)
-    fig.add_hline(y=100, row=3, col=1, line_dash="dot")
-    fig.add_hline(y=90, row=3, col=1, line_dash="dot")
-
-    fig.add_trace(go.Scatter(x=show.index, y=show["BBPCT"], name="%B"), row=4, col=1)
-    fig.add_trace(go.Scatter(x=show.index, y=show["EXT10"] * 100, name="Ext10 %"), row=4, col=1)
-    fig.add_hline(y=0.95, row=4, col=1, line_dash="dot")
-
-    fig.add_trace(go.Scatter(x=show.index, y=show["DiamondScore"], name="DiamondScore") if "DiamondScore" in show.columns else go.Scatter(x=show.index, y=show["FREEFALL_SCORE"], name="FreeFallScore"), row=5, col=1)
-    fig.update_layout(height=1100, margin=dict(l=20, r=20, t=60, b=20), legend=dict(orientation="h"))
+def price_panel(df: pd.DataFrame, symbol: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df["Adj Close"].fillna(df["Close"]), mode="lines", name="Price"))
+    if "SMA10" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA10"], mode="lines", name="SMA10", line=dict(dash="dash")))
+    if "SMA20" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], mode="lines", name="SMA20", line=dict(dash="dot")))
+    fig.update_layout(title=f"{symbol} Price", height=320, margin=dict(l=20,r=20,t=45,b=20))
     return fig
 
 
-def build_symbol_story(ind: pd.DataFrame) -> pd.DataFrame:
-    out = ind.copy()
-    out["DiamondScore"] = (
-        22 * np.minimum(1.2, np.maximum(0, out["TSI_323"] / 100.0)) +
-        13 * np.minimum(1.2, np.maximum(0, out["TSI_747"] / 80.0)) +
-        15 * np.minimum(1.2, np.maximum(0, out["CCI15"] / 120.0)) +
-        15 * np.minimum(1.2, np.maximum(0, out["BBPCT"] / 1.05)) +
-        12 * np.minimum(1.2, np.maximum(0, out["EXT10"] / 0.05)) +
-        10 * np.minimum(1.2, np.maximum(0, out["ULTIMATE_BELL"] / 100.0)) +
-        13 * (out["ULTIMATE_SLOPE3"] < 0).astype(int)
-    )
-    return out
-
-
 # =============================================================================
-# UI
+# APP
 # =============================================================================
+BUILTIN_UNIVERSES = {
+    "Starter 40": DEFAULT_UNIVERSE[:40],
+    "Default live universe": DEFAULT_UNIVERSE,
+    "ETFs only": [s for s in DEFAULT_UNIVERSE if s in {"SPY","QQQ","IWM","DIA","RSP","SMH","XLF","XLK","XLE","XLI","XLP","XLV","XLY","XLC","XLB","XLRE","XBI","ARKK","SOXX","KRE"}],
+    "Semis + AI": [s for s in DEFAULT_UNIVERSE if s in {"SMH","SOXX","NVDA","AMD","AVGO","MU","QCOM","AMAT","LRCX","KLAC","INTC","TSLA","ANET","PLTR"}],
+    "Financials focus": [s for s in DEFAULT_UNIVERSE if s in {"XLF","KRE","JPM","GS","MS","BAC","WFC","C","SCHW","BLK","KKR","BX","APO","ICE","CME","AXP","CB","PGR","FIS","FI","HOOD","COIN"}],
+}
+
 with st.sidebar:
     st.header("Universe")
-    use_builtin = st.checkbox("Use built-in liquid stock + ETF universe", value=True)
-    custom_text = st.text_area("Add tickers (comma or newline separated)", value="")
-    upload_csv = st.file_uploader("Optional CSV with a 'ticker' column", type=["csv"])
+    universe_mode = st.radio("Universe source", ["Built-in live universe", "Upload CSV/TXT", "Paste tickers"], index=0)
+    preset_name = st.selectbox("Built-in universe preset", list(BUILTIN_UNIVERSES.keys()), index=1)
+    uploaded = st.file_uploader("Optional ticker CSV/TXT (one ticker per line or a column named ticker)", type=["csv", "txt"])
+    universe_text = st.text_area("Or paste tickers", value="")
 
-    st.header("Yahoo cache")
-    full_refresh = st.checkbox("Force full refresh (slower)", value=False)
-    refresh_requested = st.button("Refresh cached data")
-    batch_size = st.slider("Batch size", 10, 50, 25, 5)
-    pause_seconds = st.slider("Pause between batches (sec)", 0.0, 3.0, 1.0, 0.25)
+    st.header("Cache refresh")
+    batch_size = st.slider("Yahoo batch size", 5, 50, 25, 5)
+    sleep_s = st.slider("Sleep between batches (sec)", 0.0, 2.0, 0.25, 0.05)
+    refresh_period = st.selectbox("Download window", ["1y", "2y", "3y"], index=1)
 
-    st.header("Scan")
-    show_only_pass = st.checkbox("Show only exact scan passes", value=True)
-    require_proxy_optionable = st.checkbox("Require optionable proxy", value=True,
-                                           help="Yahoo does not reliably expose optionability in bulk. This proxy uses price > 5 and AvgVol20 > 1M.")
-    top_n = st.slider("Top rows", 10, 100, 30, 5)
+    st.header("Diamond scan conditions")
+    min_price = st.number_input("Min price", value=5.0, step=0.5)
+    min_avg_vol = st.number_input("Min avg vol20", value=1_000_000, step=100_000)
+    require_above_sma20 = st.checkbox("Close > SMA20", value=True)
+    require_above_sma50 = st.checkbox("Close > SMA50", value=True)
+    tsi323_min = st.slider("TSI(3,2,3) >", 50, 100, 95)
+    tsi747_min = st.slider("TSI(7,4,7) >", 40, 100, 70)
+    cci_min = st.slider("CCI(15) >", 50, 200, 90)
+    require_cci_roll = st.checkbox("Today's CCI < yesterday's CCI", value=True)
+    bbpct_min = st.slider("%B(20,2) >", 0.50, 1.50, 0.95, 0.01)
+    ext10_min = st.slider("Close / SMA10 - 1 >", 0.00, 0.10, 0.03, 0.005)
+    top_n = st.slider("Top results", 5, 100, 25, 5)
 
-    st.header("Notes")
-    st.caption(
-        "This app avoids Yahoo rerun abuse by using persistent per-symbol parquet files. "
-        "Refresh updates the local warehouse; scans then run locally and return in seconds."
+
+def parse_universe() -> List[str]:
+    symbols = []
+    if uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
+                u = pd.read_csv(uploaded)
+                if "ticker" in [c.lower() for c in u.columns]:
+                    col = [c for c in u.columns if c.lower() == "ticker"][0]
+                    symbols.extend(u[col].astype(str).tolist())
+                else:
+                    symbols.extend(u.iloc[:, 0].astype(str).tolist())
+            else:
+                symbols.extend(uploaded.read().decode("utf-8", errors="ignore").replace("\n", ",").split(","))
+        except Exception:
+            pass
+    if universe_text.strip():
+        symbols.extend(universe_text.replace("\n", ",").split(","))
+    cleaned = []
+    for s in symbols:
+        t = sanitize_ticker(s)
+        if t and t not in cleaned:
+            cleaned.append(t)
+    return cleaned or DEFAULT_UNIVERSE
+
+universe = parse_universe()
+
+col1, col2, col3 = st.columns([1,1,2])
+with col1:
+    if st.button("Refresh cache"):
+        with st.spinner("Refreshing Yahoo cache..."):
+            updated, failed = refresh_cache(universe, batch_size=batch_size, sleep_s=sleep_s, period=refresh_period)
+        st.success(f"Cache refresh complete. Updated: {updated}, failed: {failed}")
+with col2:
+    if st.button("Scan now"):
+        st.session_state["run_scan"] = True
+with col3:
+    st.caption(f"Universe size: {len(universe)} symbols. Cached files: {len(list(DAILY_CACHE.glob('*.parquet')))}")
+
+if st.session_state.get("run_scan", False):
+    results = run_scan(
+        universe=universe,
+        min_price=min_price,
+        min_avg_vol=min_avg_vol,
+        tsi323_min=tsi323_min,
+        tsi747_min=tsi747_min,
+        cci_min=cci_min,
+        bbpct_min=bbpct_min,
+        ext10_min=ext10_min,
+        require_above_sma20=require_above_sma20,
+        require_above_sma50=require_above_sma50,
+        require_cci_roll=require_cci_roll,
     )
 
-# Build universe
-universe: List[str] = []
-if use_builtin:
-    universe.extend(BUILTIN_UNIVERSE)
-if custom_text.strip():
-    universe.extend(parse_tickers_from_text(custom_text))
-if upload_csv is not None:
-    try:
-        df_up = pd.read_csv(upload_csv)
-        ticker_col = next((c for c in df_up.columns if str(c).lower().strip() in {"ticker", "symbol", "tickers"}), None)
-        if ticker_col:
-            universe.extend([normalize_ticker(x) for x in df_up[ticker_col].dropna().tolist()])
-    except Exception as e:
-        st.sidebar.error(f"Could not read uploaded CSV: {e}")
-universe = sorted(set([u for u in universe if u]))
+    if results.empty:
+        st.warning("No results matched the current diamond conditions. Refresh cache or loosen thresholds.")
+    else:
+        st.subheader("Diamond scan results")
+        display = results.head(top_n).copy()
+        rename_map = {
+            "Adj Close": "Close",
+            "AVG_VOL20": "AvgVol20",
+            "CCI15_DELTA": "CCIΔ",
+            "BBPCT": "%B",
+            "EXT10": "Ext10",
+            "HEAT_SCORE": "HeatScore",
+            "DIAMOND_SCORE": "DiamondScore",
+            "ULTIMATE_SCORE": "UltimateScore",
+            "TSI_323_SCORE": "TSI323Score",
+            "TSI_747_SCORE": "TSI747Score",
+            "CCI15_SCORE": "CCIScore",
+            "BBPCT_SCORE": "BBScore",
+            "EXT10_SCORE": "ExtScore",
+        }
+        display = display.rename(columns=rename_map)
+        st.dataframe(
+            display.style.format({
+                "Close":"{:.2f}","AvgVol20":"{:,.0f}","TSI_323":"{:.1f}","TSI_747":"{:.1f}","CCI15":"{:.1f}",
+                "CCIΔ":"{:.1f}","%B":"{:.2f}","Ext10":"{:.3f}","HeatScore":"{:.1f}","DiamondScore":"{:.1f}",
+                "UltimateScore":"{:.1f}","TSI323Score":"{:.1f}","TSI747Score":"{:.1f}","CCIScore":"{:.1f}","BBScore":"{:.1f}","ExtScore":"{:.1f}"
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-st.markdown("### Universe")
-st.write(f"Loaded **{len(universe)}** tickers.")
+        snapshot_file = SNAPSHOT_CACHE / f"diamond_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        results.to_csv(snapshot_file, index=False)
+        st.download_button("Download scan snapshot", data=results.to_csv(index=False).encode("utf-8"), file_name=snapshot_file.name, mime="text/csv")
 
-if refresh_requested and universe:
-    with st.spinner("Refreshing local Yahoo cache..."):
-        refreshed, failed = refresh_symbol_cache(universe, full_refresh=full_refresh, batch_size=batch_size, pause_seconds=pause_seconds)
-    st.success(f"Refreshed {len(refreshed)} symbols.")
-    if failed:
-        st.warning(f"Failed or missing: {', '.join(failed[:20])}{' ...' if len(failed) > 20 else ''}")
+        selected = st.selectbox("Analyze ticker", display["Ticker"].tolist(), index=0)
+        raw = load_cached_symbol(selected)
+        feat = compute_features(raw)
+        if not feat.empty:
+            st.subheader(f"{selected} diamond analysis")
+            last = feat.dropna(how="all").iloc[-1]
+            prev = feat.dropna(how="all").iloc[-2] if len(feat.dropna(how="all")) > 1 else pd.Series(dtype=float)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Diamond Score", f"{safe_float(last.get('DIAMOND_SCORE')):.1f}", f"{safe_float(last.get('DIAMOND_SCORE') - prev.get('DIAMOND_SCORE', np.nan)):.1f}" if not prev.empty else None)
+            m2.metric("Ultimate Score", f"{safe_float(last.get('ULTIMATE_SCORE')):.1f}")
+            m3.metric("TSI(3,2,3)", f"{safe_float(last.get('TSI_323')):.1f}")
+            m4.metric("CCI(15)", f"{safe_float(last.get('CCI15')):.1f}")
 
-history_map = load_history_for_universe(universe, min_bars=120)
-cache_counts = pd.Series([cache_status_for_symbol(s) for s in universe]).value_counts().to_dict() if universe else {}
-col1, col2, col3 = st.columns(3)
-col1.metric("Cached symbols", len(history_map))
-col2.metric("Fresh", cache_counts.get("fresh", 0))
-col3.metric("Stale or missing", cache_counts.get("stale", 0) + cache_counts.get("missing", 0))
+            st.plotly_chart(price_panel(feat.tail(252), selected), use_container_width=True)
 
-if not universe:
-    st.info("Add tickers in the sidebar to build the scanner universe.")
-    st.stop()
+            b1, b2 = st.columns(2)
+            with b1:
+                st.plotly_chart(empirical_bell_figure(feat["ULTIMATE_SCORE"], safe_float(last.get("ULTIMATE_SCORE")), safe_float(prev.get("ULTIMATE_SCORE", np.nan)), f"{selected} Ultimate Bell"), use_container_width=True)
+                st.plotly_chart(empirical_bell_figure(feat["TSI_323_SCORE"], safe_float(last.get("TSI_323_SCORE")), safe_float(prev.get("TSI_323_SCORE", np.nan)), f"{selected} TSI(3,2,3) Bell"), use_container_width=True)
+            with b2:
+                st.plotly_chart(empirical_bell_figure(feat["CCI15_SCORE"], safe_float(last.get("CCI15_SCORE")), safe_float(prev.get("CCI15_SCORE", np.nan)), f"{selected} CCI(15) Bell"), use_container_width=True)
+                st.plotly_chart(empirical_bell_figure(feat["BBPCT_SCORE"], safe_float(last.get("BBPCT_SCORE")), safe_float(prev.get("BBPCT_SCORE", np.nan)), f"{selected} %B Bell"), use_container_width=True)
 
-if len(history_map) == 0:
-    st.warning("No cached histories yet. Click 'Refresh cached data' first.")
-    st.stop()
-
-with st.spinner("Running local scanner from cached warehouse..."):
-    scan_df, indicator_map = scan_latest(history_map, require_proxy_optionable=require_proxy_optionable)
-
-if scan_df.empty:
-    st.warning("No scannable symbols found from cache.")
-    st.stop()
-
-# Filter results
-result_df = scan_df.copy()
-if show_only_pass:
-    result_df = result_df[result_df["ScanPass"]].copy()
-result_df = result_df.head(top_n)
-
-st.markdown("### Scan results")
-st.caption(
-    "Exact scan conditions: close > 5, avg vol20 > 1M, close > SMA20, close > SMA50, "
-    "TSI(3,2,3) > 95, TSI(7,4,7) > 70, CCI(15) > 90, today's CCI < yesterday's CCI, %B > 0.95, Ext10 > 3%."
-)
-
-styled = result_df[[
-    "Ticker", "Sector", "Date", "Close", "TSI(3,2,3)", "TSI(7,4,7)", "CCI(15)", "CCIΔ", "%B(20,2)", "Ext10", "UltimateBell", "DiamondScore", "Freshness"
-]].copy()
-st.dataframe(
-    styled.style.format({
-        "Close": "{:.2f}", "TSI(3,2,3)": "{:.1f}", "TSI(7,4,7)": "{:.1f}", "CCI(15)": "{:.1f}",
-        "CCIΔ": "{:.1f}", "%B(20,2)": "{:.2f}", "Ext10": "{:.2%}", "UltimateBell": "{:.1f}", "DiamondScore": "{:.1f}"
-    }),
-    use_container_width=True,
-    hide_index=True,
-)
-
-sector_counts = result_df["Sector"].value_counts().reset_index()
-sector_counts.columns = ["Sector", "Count"]
-left, right = st.columns([1, 2])
-with left:
-    st.markdown("#### Sector concentration")
-    st.dataframe(sector_counts, use_container_width=True, hide_index=True)
-with right:
-    fig_sector = go.Figure(go.Bar(x=sector_counts["Sector"], y=sector_counts["Count"]))
-    fig_sector.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=20))
-    st.plotly_chart(fig_sector, use_container_width=True)
-
-# Ticker detail
-available_detail = result_df["Ticker"].tolist() if len(result_df) else scan_df["Ticker"].tolist()
-default_pick = available_detail[0] if available_detail else scan_df.iloc[0]["Ticker"]
-selected_ticker = st.selectbox("Analyze ticker", options=scan_df["Ticker"].tolist(), index=scan_df["Ticker"].tolist().index(default_pick) if default_pick in scan_df["Ticker"].tolist() else 0)
-
-ind = indicator_map[selected_ticker].copy()
-ind = build_symbol_story(ind)
-last = ind.iloc[-1]
-prev = ind.iloc[-2] if len(ind) > 1 else last
-
-st.markdown(f"### {selected_ticker} diamond analysis")
-metrics = st.columns(6)
-metrics[0].metric("Close", f"{last['Close']:.2f}")
-metrics[1].metric("DiamondScore", f"{last['DiamondScore']:.1f}")
-metrics[2].metric("UltimateBell", f"{last['ULTIMATE_BELL']:.1f}", f"{(last['ULTIMATE_BELL'] - prev['ULTIMATE_BELL']):.1f}")
-metrics[3].metric("TSI(3,2,3)", f"{last['TSI_323']:.1f}", f"{(last['TSI_323'] - prev['TSI_323']):.1f}")
-metrics[4].metric("CCI(15)", f"{last['CCI15']:.1f}", f"{(last['CCI15'] - prev['CCI15']):.1f}")
-metrics[5].metric("%B(20,2)", f"{last['BBPCT']:.2f}", f"{(last['BBPCT'] - prev['BBPCT']):.2f}")
-
-st.plotly_chart(line_stack_figure(ind, selected_ticker), use_container_width=True)
-
-b1, b2 = st.columns(2)
-with b1:
-    st.plotly_chart(bell_curve_figure(ind["ULTIMATE_BELL"], float(last["ULTIMATE_BELL"]), "Ultimate Bell Distribution"), use_container_width=True)
-    st.plotly_chart(bell_curve_figure(ind["TSI_323_BELL"], float(last["TSI_323_BELL"]), "TSI(3,2,3) Bell"), use_container_width=True)
-with b2:
-    st.plotly_chart(bell_curve_figure(ind["CCI15_BELL"], float(last["CCI15_BELL"]), "CCI(15) Bell"), use_container_width=True)
-    st.plotly_chart(bell_curve_figure(ind["BBPCT_BELL"], float(last["BBPCT_BELL"]), "%B Bell"), use_container_width=True)
-
-with st.expander("Latest indicator snapshot"):
-    latest_cols = [
-        "Close", "AVG_VOL20", "SMA10", "SMA20", "SMA50", "TSI_323", "TSI_747", "CCI15", "BBPCT", "EXT10",
-        "TSI_323_BELL", "TSI_747_BELL", "CCI15_BELL", "BBPCT_BELL", "EXT10_BELL", "ULTIMATE_BELL", "FREEFALL_SCORE", "DiamondScore"
-    ]
-    snap = ind[latest_cols].tail(10).copy()
-    st.dataframe(snap.style.format({c: "{:.2f}" for c in snap.columns}), use_container_width=True)
-
-# download snapshot cache summary
-snapshot_df = scan_df.copy()
-snapshot_file = SNAPSHOT_CACHE_DIR / f"diamond_scan_{today_str()}.csv"
-snapshot_df.to_csv(snapshot_file, index=False)
-with st.expander("Download today's local scan snapshot"):
-    st.download_button(
-        "Download scan CSV",
-        data=snapshot_df.to_csv(index=False).encode("utf-8"),
-        file_name=snapshot_file.name,
-        mime="text/csv",
-    )
+            comp = pd.DataFrame({
+                "Component": ["HeatScore", "DiamondScore", "UltimateScore", "TSI323Score", "TSI747Score", "CCIScore", "BBScore", "ExtScore"],
+                "Value": [
+                    safe_float(last.get("HEAT_SCORE")), safe_float(last.get("DIAMOND_SCORE")), safe_float(last.get("ULTIMATE_SCORE")),
+                    safe_float(last.get("TSI_323_SCORE")), safe_float(last.get("TSI_747_SCORE")), safe_float(last.get("CCI15_SCORE")),
+                    safe_float(last.get("BBPCT_SCORE")), safe_float(last.get("EXT10_SCORE"))
+                ]
+            })
+            st.dataframe(comp.style.format({"Value":"{:.1f}"}), use_container_width=True, hide_index=True)
+else:
+    st.info("Using the built-in live universe by default. Click Refresh cache, then Scan now.")
