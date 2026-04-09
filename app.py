@@ -385,6 +385,73 @@ BUILTIN_UNIVERSES = {
     "Financials focus": [s for s in DEFAULT_UNIVERSE if s in {"XLF","KRE","JPM","GS","MS","BAC","WFC","C","SCHW","BLK","KKR","BX","APO","ICE","CME","AXP","CB","PGR","FIS","FI","HOOD","COIN"}],
 }
 
+
+SCAN_PROFILES = {
+    "Custom": None,
+    "Watchlist": {
+        "min_price": 5.0,
+        "min_avg_vol": 1_000_000.0,
+        "require_above_sma20": True,
+        "require_above_sma50": True,
+        "tsi323_min": 93.0,
+        "tsi747_min": 68.0,
+        "cci_min": 85.0,
+        "require_cci_roll": True,
+        "bbpct_min": 0.92,
+        "ext10_min": 0.028,
+    },
+    "Standard Diamond": {
+        "min_price": 5.0,
+        "min_avg_vol": 1_000_000.0,
+        "require_above_sma20": True,
+        "require_above_sma50": True,
+        "tsi323_min": 95.0,
+        "tsi747_min": 70.0,
+        "cci_min": 90.0,
+        "require_cci_roll": True,
+        "bbpct_min": 0.95,
+        "ext10_min": 0.03,
+    },
+    "Aggressive Fade": {
+        "min_price": 5.0,
+        "min_avg_vol": 1_000_000.0,
+        "require_above_sma20": True,
+        "require_above_sma50": True,
+        "tsi323_min": 96.0,
+        "tsi747_min": 72.0,
+        "cci_min": 95.0,
+        "require_cci_roll": True,
+        "bbpct_min": 0.98,
+        "ext10_min": 0.032,
+    },
+}
+
+FIRE_OVERRIDES = {
+    "tsi323_min": 97.0,
+    "tsi747_min": 75.0,
+    "cci_min": 100.0,
+    "bbpct_min": 1.00,
+    "ext10_min": 0.035,
+    "require_cci_roll": True,
+    "require_above_sma20": True,
+    "require_above_sma50": True,
+}
+
+
+def apply_scan_profile(profile_name: str, fire_mode: bool = False) -> Dict[str, float]:
+    base = SCAN_PROFILES.get(profile_name)
+    if not base:
+        base = SCAN_PROFILES["Standard Diamond"].copy()
+    else:
+        base = base.copy()
+    if fire_mode:
+        for key, value in FIRE_OVERRIDES.items():
+            if isinstance(value, bool):
+                base[key] = value
+            else:
+                base[key] = max(float(base.get(key, value)), float(value))
+    return base
+
 with st.sidebar:
     st.header("Universe")
     universe_mode = st.radio("Universe source", ["Built-in live universe", "Upload CSV/TXT", "Paste tickers"], index=0)
@@ -397,23 +464,32 @@ with st.sidebar:
     sleep_s = st.slider("Sleep between batches (sec)", 0.0, 2.0, 0.25, 0.05)
     refresh_period = st.selectbox("Download window", ["1y", "2y", "3y"], index=1)
 
-    st.header("Diamond scan conditions")
-    min_price = st.number_input("Min price", value=5.0, step=0.5)
-    min_avg_vol = st.number_input("Min avg vol20", value=1_000_000, step=100_000)
-    require_above_sma20 = st.checkbox("Close > SMA20", value=True)
-    require_above_sma50 = st.checkbox("Close > SMA50", value=True)
-    tsi323_min = st.slider("TSI(3,2,3) >", 50, 100, 95)
-    tsi747_min = st.slider("TSI(7,4,7) >", 40, 100, 70)
-    cci_min = st.slider("CCI(15) >", 50, 200, 90)
-    require_cci_roll = st.checkbox("Today's CCI < yesterday's CCI", value=True)
-    bbpct_min = st.slider("%B(20,2) >", 0.50, 1.50, 0.95, 0.01)
-    ext10_min = st.slider("Close / SMA10 - 1 >", 0.00, 0.10, 0.03, 0.005)
+    st.header("Scan logic")
+    scan_profile_name = st.selectbox("Preset scan logic", list(SCAN_PROFILES.keys()), index=1)
+    fire_mode = st.checkbox("Fire mode (sure-fire only)", value=False, help="Tightens the scan to only the hottest names that are already starting to cool.")
+    profile_values = apply_scan_profile(scan_profile_name, fire_mode)
+
+    st.caption("Toggle a preset first, then fine-tune below if you want.")
+    min_price = st.number_input("Min price", value=float(profile_values["min_price"]), step=0.5)
+    min_avg_vol = st.number_input("Min avg vol20", value=float(profile_values["min_avg_vol"]), step=100_000.0)
+    require_above_sma20 = st.checkbox("Close > SMA20", value=bool(profile_values["require_above_sma20"]))
+    require_above_sma50 = st.checkbox("Close > SMA50", value=bool(profile_values["require_above_sma50"]))
+    tsi323_min = st.slider("TSI(3,2,3) >", 50.0, 100.0, float(profile_values["tsi323_min"]), 1.0)
+    tsi747_min = st.slider("TSI(7,4,7) >", 40.0, 100.0, float(profile_values["tsi747_min"]), 1.0)
+    cci_min = st.slider("CCI(15) >", 50.0, 200.0, float(profile_values["cci_min"]), 1.0)
+    require_cci_roll = st.checkbox("Today's CCI < yesterday's CCI", value=bool(profile_values["require_cci_roll"]))
+    bbpct_min = st.slider("%B(20,2) >", 0.50, 1.50, float(profile_values["bbpct_min"]), 0.01)
+    ext10_min = st.slider("Close / SMA10 - 1 >", 0.00, 0.10, float(profile_values["ext10_min"]), 0.005)
     top_n = st.slider("Top results", 5, 100, 25, 5)
 
 
 def parse_universe() -> List[str]:
-    symbols = []
-    if uploaded is not None:
+    symbols: List[str] = []
+
+    if universe_mode == "Built-in live universe":
+        symbols.extend(BUILTIN_UNIVERSES.get(preset_name, DEFAULT_UNIVERSE))
+
+    if universe_mode == "Upload CSV/TXT" and uploaded is not None:
         try:
             if uploaded.name.lower().endswith(".csv"):
                 u = pd.read_csv(uploaded)
@@ -426,14 +502,16 @@ def parse_universe() -> List[str]:
                 symbols.extend(uploaded.read().decode("utf-8", errors="ignore").replace("\n", ",").split(","))
         except Exception:
             pass
-    if universe_text.strip():
+
+    if universe_mode == "Paste tickers" and universe_text.strip():
         symbols.extend(universe_text.replace("\n", ",").split(","))
-    cleaned = []
+
+    cleaned: List[str] = []
     for s in symbols:
         t = sanitize_ticker(s)
         if t and t not in cleaned:
             cleaned.append(t)
-    return cleaned or DEFAULT_UNIVERSE
+    return cleaned or BUILTIN_UNIVERSES.get(preset_name, DEFAULT_UNIVERSE)
 
 universe = parse_universe()
 
@@ -447,7 +525,9 @@ with col2:
     if st.button("Scan now"):
         st.session_state["run_scan"] = True
 with col3:
+    active_logic = "Fire" if fire_mode else scan_profile_name
     st.caption(f"Universe size: {len(universe)} symbols. Cached files: {len(list(DAILY_CACHE.glob('*.parquet')))}")
+    st.caption(f"Active scan logic: {active_logic}")
 
 if st.session_state.get("run_scan", False):
     results = run_scan(
@@ -532,4 +612,4 @@ if st.session_state.get("run_scan", False):
             })
             st.dataframe(comp.style.format({"Value":"{:.1f}"}), use_container_width=True, hide_index=True)
 else:
-    st.info("Using the built-in live universe by default. Click Refresh cache, then Scan now.")
+    st.info("Using the built-in live universe by default. Pick a scan preset or enable Fire mode, then click Refresh cache and Scan now.")
